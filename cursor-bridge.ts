@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const AGENT_DIR =
@@ -37,24 +38,56 @@ type CursorShared = {
 };
 type CursorIndex = { registerSessionLifecycleCleanup?: (pi: ExtensionAPI) => void };
 
-let sharedMod: CursorShared | undefined;
+let sharedModPromise: Promise<CursorShared | undefined> | undefined;
 let indexMod: CursorIndex | undefined;
 let proxyPort: number | undefined;
+let loadAttempt = 0;
 
+/**
+ * A module that threw during evaluation stays cached as FAILED under its own URL, so a plain
+ * re-import would replay the original error forever. Only the retry path pays for a fresh
+ * instance, and only after the previous one proved unusable.
+ */
+function loadSpecifier(entry: string): string {
+	return loadAttempt === 0
+		? entry
+		: `${pathToFileURL(entry).href}?pi-multi-account-retry=${loadAttempt}`;
+}
+
+/**
+ * Cache the in-flight PROMISE, not the settled module.
+ *
+ * Discovery fires this without awaiting while `session_start` awaits its own call, so both
+ * used to reach the import at once. A second concurrent import of the same module observes it
+ * mid-initialization: hoisted functions are already callable while its `let` state is still in
+ * the temporal dead zone, which surfaced as "Cannot access 'tokenResolver' before
+ * initialization" and cost the session every Cursor account. One shared promise means the
+ * module is imported exactly once, no matter how many callers race.
+ */
 async function loadCursorModules(): Promise<CursorShared | undefined> {
-	if (sharedMod) return sharedMod;
-	const entry = join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts");
-	if (!existsSync(entry)) return undefined;
-	sharedMod = (await import(
-		/* @vite-ignore */ join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts")
-	)) as CursorShared;
-	const indexEntry = join(CURSOR_PROVIDER_ROOT, "index.ts");
-	if (existsSync(indexEntry)) {
-		indexMod = (await import(
-			/* @vite-ignore */ indexEntry
-		)) as CursorIndex;
-	}
-	return sharedMod;
+	sharedModPromise ??= (async () => {
+		const entry = join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts");
+		if (!existsSync(entry)) return undefined;
+		try {
+			const shared = (await import(
+				/* @vite-ignore */ loadSpecifier(entry)
+			)) as CursorShared;
+			const indexEntry = join(CURSOR_PROVIDER_ROOT, "index.ts");
+			if (existsSync(indexEntry)) {
+				indexMod = (await import(
+					/* @vite-ignore */ loadSpecifier(indexEntry)
+				)) as CursorIndex;
+			}
+			return shared;
+		} catch (error) {
+			// A failed import must not poison the cache forever: a user who fixes the clone
+			// (or clones it at all) gets a fresh attempt on the next discovery pass.
+			sharedModPromise = undefined;
+			loadAttempt++;
+			throw error;
+		}
+	})();
+	return sharedModPromise;
 }
 
 type AuthEntry = {

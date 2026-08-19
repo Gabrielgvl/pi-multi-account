@@ -1,12 +1,12 @@
 # pi-multi-account
 
-Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, **Qwen / Alibaba**, and **Ollama**.
+Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **OpenAI / ChatGPT Codex**, **Kimi For Coding**, **Cursor**, **Qwen / Alibaba**, and **Ollama**.
 
 When the account you are using hits a quota or rate limit, `pi-multi-account` transparently switches to the next authenticated account/model and (optionally) resumes the interrupted task — so a long agent run does not die just because one account ran out of budget.
 
 ## What it does
 
-- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
+- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, OpenAI/ChatGPT Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
 - **Grows the rotation on login.** Run `/login`, choose **Use a subscription**, then select a numbered slot such as `anthropic-account-3` or `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
 - **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
 - **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
@@ -93,8 +93,8 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
 | `limits [refresh]` | Show active-account 5h/7d limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
 | `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex model catalogs now. |
-| `add [anthropic\|codex\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. |
-| `remove [anthropic\|codex\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
+| `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
+| `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |

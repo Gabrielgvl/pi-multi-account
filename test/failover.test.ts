@@ -177,6 +177,7 @@ function setup(opts: {
 		Object.keys(accounts).filter((id) => !opts.unknownProviders?.includes(id)),
 	);
 	const registeredModels = new Map<string, any[]>();
+	const providerConfigs = new Map<string, any>();
 	const mkModel = (provider: string, id: string) => ({ provider, id });
 	const rec = {
 		sent: [] as Array<{ prompt: string; options?: Record<string, unknown> }>,
@@ -276,6 +277,7 @@ function setup(opts: {
 	const pi: any = {
 		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
 			known.add(name);
+			providerConfigs.set(name, providerConfig);
 			if (providerConfig?.models) {
 				registeredModels.set(
 					name,
@@ -370,6 +372,7 @@ function setup(opts: {
 		input,
 		thinkingLevel,
 		userSetsThinking,
+		providerConfigs,
 	};
 }
 
@@ -2403,6 +2406,98 @@ test("Alibaba/Qwen alias slots (alibaba-account-2) join the rotation", async () 
 	);
 });
 
+test("Kimi alias slots (kimi-coding-account-2) join the rotation", async () => {
+	const accounts = {
+		"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+		"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+		anthropic: { type: "oauth", access: "a", refresh: "ar" },
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: {
+			autoDiscover: true,
+			fallbacks: ["anthropic", "kimi-coding", "kimi-coding-account-2"],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	const startup = t.rec.notifies.find((m) =>
+		m.includes("account(s) in rotation"),
+	);
+	assert.ok(startup, "session_start must report rotation size");
+	assert.ok(
+		/3 account\(s\) in rotation/.test(startup),
+		`expected 3 accounts in rotation, got: ${startup}`,
+	);
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	const switchedToKimi = t.rec.setModels.some((m) => m.startsWith("kimi-coding"));
+	assert.ok(
+		switchedToKimi,
+		`a 429 on anthropic must fail over to a Kimi slot, got: ${t.rec.setModels.join(", ")}`,
+	);
+});
+
+test("a Kimi subscription slot is registered so /login can offer it", async () => {
+	// The whole point of `add kimi`: the NEXT free slot must exist as a real provider
+	// before the user runs /login, or the picker has nothing to select.
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	const slot = t.providerConfigs.get("kimi-coding-account-2");
+	assert.ok(slot, "the spare Kimi slot must be registered as a provider");
+	assert.equal(slot.baseUrl, "https://api.kimi.com/coding");
+	assert.equal(slot.api, "anthropic-messages");
+	assert.ok(
+		slot.models.some((model: any) => model.id === "k3"),
+		"the slot must carry Kimi's own catalog, not an empty model list",
+	);
+	assert.equal(
+		slot.oauth.isSubscription,
+		true,
+		"it must present as a subscription login, not an API key",
+	);
+	assert.equal(
+		typeof slot.oauth.login,
+		"function",
+		"/login needs a real login flow on the slot",
+	);
+	assert.equal(
+		slot.oauth.getApiKey({ type: "oauth", access: "tok", refresh: "r" }),
+		"tok",
+		"requests must authenticate with THIS slot's access token",
+	);
+	// The base provider is Pi's own; the extension must not shadow it.
+	assert.equal(
+		t.providerConfigs.has("kimi-coding"),
+		false,
+		"the native base Kimi provider must be left alone",
+	);
+});
+
+test("add kimi points at the interactive subscription login, not a manual api key", async () => {
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+	});
+	await t.fire("session_start");
+	await t.command("add kimi");
+	const notice = t.rec.notifies.at(-1) ?? "";
+	assert.match(notice, /kimi-coding-account-2/);
+	assert.match(notice, /\/login/);
+	assert.doesNotMatch(
+		notice,
+		/auth\.json/,
+		"Kimi has a device-code OAuth flow; telling the user to paste an API key by hand was the bug",
+	);
+});
+
 test("immediate failover never injects a continuation user message", async () => {
 	const t = setup({
 		accounts: TWO_ACCOUNTS,
@@ -2414,7 +2509,6 @@ test("immediate failover never injects a continuation user message", async () =>
 	assert.equal(t.rec.continueCalls.length, 1);
 	assert.equal(t.rec.sent.length, 0);
 });
-
 test("malformed config arrays are sanitized instead of crashing failover", async () => {
 	const t = setup({
 		accounts: TWO_ACCOUNTS,

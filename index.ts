@@ -85,6 +85,15 @@ type PiAiOauthBridge = {
 		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
 		getApiKey: (credentials: any) => string;
 	};
+	/**
+	 * Optional: Kimi exists only in pi-ai's provider-factories era, never in the
+	 * legacy oauth.js entry. Absence must not disqualify an otherwise usable bridge.
+	 */
+	kimi?: {
+		login: (callbacks: any) => Promise<any>;
+		refresh: (credentials: any, signal: AbortSignal) => Promise<any>;
+		getApiKey: (credentials: any) => string;
+	};
 };
 
 let piAiOauthBridge: PiAiOauthBridge | undefined;
@@ -222,9 +231,11 @@ function adaptLegacyOauthEntry(mod: any): PiAiOauthBridge | undefined {
 function adaptProviderFactories(
 	anthropicMod: any,
 	codexMod: any,
+	kimiMod?: any,
 ): PiAiOauthBridge | undefined {
 	const anthropicOauth = anthropicMod?.anthropicProvider?.()?.auth?.oauth;
 	const codexOauth = codexMod?.openaiCodexProvider?.()?.auth?.oauth;
+	const kimiOauth = kimiMod?.kimiCodingProvider?.()?.auth?.oauth;
 	if (
 		typeof anthropicOauth?.login !== "function" ||
 		typeof anthropicOauth?.refresh !== "function" ||
@@ -248,6 +259,15 @@ function adaptProviderFactories(
 			// Identical to what pi-ai <= 0.79's getApiKey did (verified in its source).
 			getApiKey: (credentials) => credentials.access,
 		},
+		kimi:
+			typeof kimiOauth?.login === "function" &&
+			typeof kimiOauth?.refresh === "function"
+				? {
+						login: (callbacks) => kimiOauth.login(toAuthInteraction(callbacks)),
+						refresh: (credentials, signal) => kimiOauth.refresh(credentials, signal),
+						getApiKey: (credentials) => credentials.access,
+					}
+				: undefined,
 	};
 }
 
@@ -291,6 +311,7 @@ function tryLoadPiAiOauth(): PiAiOauthBridge | undefined {
 	const modern = adaptProviderFactories(
 		load(join("providers", "anthropic.js")),
 		load(join("providers", "openai-codex.js")),
+		load(join("providers", "kimi-coding.js")),
 	);
 	if (modern) {
 		piAiOauthBridge = modern;
@@ -2010,6 +2031,79 @@ function registerCodexCatalog(
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, name),
 		models: models as any,
+	});
+}
+
+// ----- Kimi For Coding (subscription, device-flow OAuth) ---------------------
+
+const KIMI_BASE = "kimi-coding";
+const KIMI_BASE_URL = "https://api.kimi.com/coding";
+// Mirrors pi-ai's bundled kimi-coding catalog; piAiGetModel() enriches each entry
+// with canonical metadata when the installed pi-ai is new enough to have it.
+const DEFAULT_KIMI_MODELS = [
+	"k3",
+	"k3-256k",
+	"kimi-for-coding",
+	"kimi-for-coding-highspeed",
+];
+
+function kimiModelDef(id: string, providerId: string) {
+	const canonical = piAiGetModel(KIMI_BASE, id) as any;
+	if (canonical) return { ...canonical, provider: providerId };
+	return {
+		id,
+		name: id,
+		api: "anthropic-messages",
+		provider: providerId,
+		baseUrl: KIMI_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+	};
+}
+
+function kimiOAuthOverride(providerId: string, name: string) {
+	// kimi exists only in pi-ai's provider-factories era, so the bridge field is
+	// optional — resolve it lazily and fail loudly only on a real login attempt,
+	// never while Pi is merely listing providers.
+	const getProvider = () => {
+		const kimi = requirePiAiOauth().kimi;
+		if (!kimi) {
+			throw new Error(
+				"pi-multi-account: this @earendil-works/pi-ai exposes no Kimi OAuth flow; upgrade pi-ai to log Kimi slots in via subscription.",
+			);
+		}
+		return kimi;
+	};
+	return {
+		name,
+		isSubscription: true,
+		async login(callbacks: any) {
+			return rejectDuplicateLogin(providerId, await getProvider().login(callbacks));
+		},
+		async refreshToken(credentials: any, signal?: AbortSignal) {
+			return getProvider().refresh(credentials, oauthRefreshSignal(signal));
+		},
+		getApiKey(credentials: any) {
+			return credentials.access;
+		},
+	};
+}
+
+function registerKimiSlot(
+	pi: ExtensionAPI,
+	id: string,
+	modelIds: string[] = DEFAULT_KIMI_MODELS,
+) {
+	if (id === KIMI_BASE) return; // base provider is native to Pi (pi-ai ships it)
+	pi.registerProvider(id, {
+		name: `Kimi For Coding (${id})`,
+		baseUrl: KIMI_BASE_URL,
+		api: "anthropic-messages" as any,
+		oauth: kimiOAuthOverride(id, `Kimi For Coding (${id})`),
+		models: modelIds.map((m) => kimiModelDef(m, id)) as any,
 	});
 }
 
@@ -4327,6 +4421,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const families: ProviderFamily[] = [
 			"anthropic",
 			"openai-codex",
+			"kimi-coding",
 			...(cursorAvailable ? (["cursor"] as const) : []),
 			"ollama",
 			"qwen",
@@ -4347,6 +4442,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (
 				family === "anthropic" ||
 				family === "openai-codex" ||
+				family === "kimi-coding" ||
 				family === "cursor"
 			) {
 				let spare = 2;
@@ -4382,6 +4478,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							? (cached as Array<Record<string, unknown>>)
 							: undefined,
 					);
+				} else if (family === "kimi-coding") {
+					// Built-in catalog first, then any kimi model the host already knows
+					// (e.g. a tag from models.json) so it stays selectable on the slot too.
+					registerKimiSlot(pi, id, [
+						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
+					]);
 				} else if (family === "ollama" || family === "qwen") {
 					registerApiKeySlot(pi, id, family, config.qwenProvider, ctx);
 				}
@@ -6148,6 +6250,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (
 				family === "anthropic" ||
 				family === "openai-codex" ||
+				family === "kimi-coding" ||
 				family === "cursor"
 			) {
 				const loginHint =
