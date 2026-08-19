@@ -454,6 +454,12 @@ type ProviderFailoverConfig = {
 	includeOtherProviders?: boolean;
 	includeCursor?: boolean;
 	/**
+	 * When true, `/model` shows only the currently active rotation account: every other
+	 * provider is re-registered with an empty model list (its auth and OAuth config are
+	 * preserved by Pi's merge) and restored on switch or when the flag goes off.
+	 */
+	onlyActive?: boolean;
+	/**
 	 * Provider ids this extension must never fail away from, even on an actionable error.
 	 *
 	 * For providers we do not manage (no cooldown/refresh lifecycle of ours) that run their own
@@ -535,6 +541,7 @@ type RuntimeConfig = Required<
 		| "includeOllama"
 		| "includeOtherProviders"
 		| "includeCursor"
+		| "onlyActive"
 		| "neverFailoverProviders"
 		| "providerOrder"
 		| "cooldownMs"
@@ -1303,6 +1310,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeOtherProviders: raw.includeOtherProviders ?? true,
 		includeCursor: raw.includeCursor ?? true,
+		onlyActive: raw.onlyActive ?? false,
 		neverFailoverProviders: stringArray(raw.neverFailoverProviders),
 		providerOrder: order.filter(
 			(f): f is ProviderFamily =>
@@ -2799,6 +2807,96 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	debugLogEnabled = config.debugLog;
 	let configuredFallbacks = config.fallbacks.slice();
 	let persistedState = loadState();
+
+	// ----- only-active model filter -------------------------------------------
+	// When enabled, /model shows only the active rotation account: every other
+	// provider is re-registered with `models: []` (Pi merges re-registrations, so
+	// auth/OAuth config survives) and restored from here on switch or disable.
+	let onlyActiveModels = config.onlyActive;
+	/** Models of the providers WE hid, freshest copy — the only way back. */
+	const hiddenProviderModels = new Map<string, any[]>();
+
+	function unhideProvider(provider: string) {
+		const models = hiddenProviderModels.get(provider);
+		if (!models) return;
+		try {
+			pi.registerProvider(provider, { models } as any);
+			hiddenProviderModels.delete(provider);
+		} catch (error) {
+			logEvent("only_active_restore_failed", {
+				provider,
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	function clearOnlyActiveFilter() {
+		for (const provider of [...hiddenProviderModels.keys()]) unhideProvider(provider);
+	}
+
+	/**
+	 * Narrow /model to the active account. Idempotent and cheap: a provider we already
+	 * hid shows zero models in the registry, so there is nothing to re-hide, and a
+	 * provider that re-registered itself (catalog sync) is re-hidden with the FRESH
+	 * model list stored for restore. Never touches the active provider's registration
+	 * beyond restoring what we previously hid.
+	 */
+	function applyOnlyActiveFilter(ctx: any, activeProvider?: string) {
+		if (!onlyActiveModels) return;
+		const active = activeProvider ?? ctx?.model?.provider;
+		if (!active) return;
+		let all: any[] = [];
+		try {
+			all = ctx?.modelRegistry?.getAll?.() ?? [];
+		} catch {
+			return;
+		}
+		const visibleByProvider = new Map<string, any[]>();
+		for (const model of all) {
+			if (!model?.provider || typeof model.id !== "string") continue;
+			const list = visibleByProvider.get(model.provider);
+			if (list) list.push(model);
+			else visibleByProvider.set(model.provider, [model]);
+		}
+		for (const [provider, models] of visibleByProvider) {
+			if (provider === active) {
+				unhideProvider(provider);
+				continue;
+			}
+			if (!models.length) continue; // already hidden (or genuinely empty)
+			hiddenProviderModels.set(provider, models);
+			try {
+				pi.registerProvider(provider, { models: [] } as any);
+			} catch (error) {
+				hiddenProviderModels.delete(provider);
+				logEvent("only_active_hide_failed", {
+					provider,
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	/** pi.setModel that first restores the target's models when the filter hid them. */
+	async function setModelEnsuringVisible(
+		target: { provider: string; id: string },
+		ctx: any,
+	) {
+		if (onlyActiveModels) unhideProvider(target.provider);
+		return pi.setModel(target as any);
+	}
+
+	/**
+	 * Registry lookup that also sees providers the filter hid. Without it the failover's
+	 * own candidate search would starve: a hidden provider shows zero models, so the
+	 * rotation could never switch INTO it.
+	 */
+	function findModelIncludingHidden(ctx: any, provider: string, modelId: string) {
+		return (
+			ctx.modelRegistry.find(provider, modelId) ??
+			hiddenProviderModels.get(provider)?.find((m: any) => m.id === modelId)
+		);
+	}
 
 	// Clamp any persisted far-future cooldown on load: a pre-fix (or mis-parsed long-window) state
 	// could carry a weeks-away reset that would keep evicting a live account until it expired. Cap it
@@ -4664,7 +4762,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const parsed = parseTarget(target);
 		if (!parsed) return [];
 		if (parsed.modelId) {
-			const model = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
+			const model = findModelIncludingHidden(ctx, parsed.provider, parsed.modelId);
 			return model ? [model] : [];
 		}
 
@@ -4684,10 +4782,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const usePreferredOnly = preferredOnly && preferred.length > 0;
 		const registryModels = usePreferredOnly
 			? []
-			: ctx.modelRegistry
-					.getAll()
-					.filter((model: any) => model.provider === parsed.provider)
-					.map((model: any) => model.id);
+			: [
+					...ctx.modelRegistry
+						.getAll()
+						.filter((model: any) => model.provider === parsed.provider),
+					...(hiddenProviderModels.get(parsed.provider) ?? []),
+				].map((model: any) => model.id);
 		// preferLatestModel (default): try the newest preferred model FIRST, so a turn that was
 		// once downgraded (e.g. gpt-5.4 after a momentary limit on gpt-5.5) is upgraded back to
 		// the latest the moment it is available again — instead of carrying the old model forever.
@@ -4700,7 +4800,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const modelId of modelIds) {
 			if (seen.has(modelId)) continue;
 			seen.add(modelId);
-			const model = ctx.modelRegistry.find(parsed.provider, modelId);
+			const model = findModelIncludingHidden(ctx, parsed.provider, modelId);
 			if (model) result.push(model);
 		}
 		return result;
@@ -4945,7 +5045,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			) {
 				automaticModelTarget = to;
 				try {
-					ok = await pi.setModel(fallback);
+					ok = await setModelEnsuringVisible(fallback, ctx);
 				} catch {
 					ok = false;
 				}
@@ -4958,7 +5058,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				if (providerHasUsableAuth(ctx, fallback.provider)) {
 					automaticModelTarget = to;
 					try {
-						ok = await pi.setModel(fallback);
+						ok = await setModelEnsuringVisible(fallback, ctx);
 					} catch {
 						ok = false;
 					}
@@ -4979,6 +5079,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				continue;
 			}
 			restoreDesiredThinking(ctx);
+			applyOnlyActiveFilter(ctx, fallback.provider);
 			setLastProbe(fallback.provider);
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
@@ -5805,6 +5906,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					ctx.model?.id !== sourceModel.id
 				) {
 					automaticModelTarget = same;
+					if (onlyActiveModels) unhideProvider(sourceModel.provider);
 					try {
 						await pi.setModel(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
@@ -6188,6 +6290,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (command === "reload") {
 			const previousAutoDiscoverModels = config.autoDiscoverModels;
 			config = loadConfig();
+			if (config.onlyActive !== onlyActiveModels) {
+				onlyActiveModels = config.onlyActive;
+				if (onlyActiveModels) applyOnlyActiveFilter(ctx);
+				else clearOnlyActiveFilter();
+			}
 			debugLogEnabled = config.debugLog;
 			configuredFallbacks = config.fallbacks.slice();
 			if (config.autoDiscoverModels !== previousAutoDiscoverModels) {
@@ -6654,6 +6761,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				);
 			return;
 		}
+		if (command === "only-active" || command === "focus") {
+			const next2 =
+				arg1 === "on" ? true : arg1 === "off" ? false : !onlyActiveModels;
+			onlyActiveModels = next2;
+			config = { ...config, onlyActive: next2 };
+			try {
+				const raw = existsSync(CONFIG_PATH)
+					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+					: {};
+				raw.onlyActive = next2;
+				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			} catch {
+				// non-fatal: the in-memory flag still applies for this session
+			}
+			if (next2) applyOnlyActiveFilter(ctx);
+			else clearOnlyActiveFilter();
+			ctx.ui.notify(
+				next2
+					? "pi-multi-account: only-active ON — /model shows only the active account's models; the filter follows every switch"
+					: "pi-multi-account: only-active OFF — every provider's models restored",
+				"info",
+			);
+			return;
+		}
 		if (command === "next") {
 			if (ctx.model) {
 				currentPromptSwitch = undefined;
@@ -6745,7 +6879,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | best | limits [refresh] | models | log [N|on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | best | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
@@ -6936,6 +7070,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		refreshDiscovery(true, ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
+		applyOnlyActiveFilter(ctx);
 		pruneCooldowns();
 		// Tight session binding: every session starts as a clean slate. Auto-resume only ever
 		// runs *inside the live session that hit the limit* (its timer is armed by
@@ -7022,6 +7157,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			noteResumeProgress();
 		});
 	}
+	// Async re-registrations (Cursor/Codex catalog discovery) restore full model lists
+	// behind the filter's back; re-narrow at the start of every turn.
+	safeOn("message_start", (_event, ctx) => applyOnlyActiveFilter(ctx));
 	// Tool lifecycle also adjusts the in-flight count so a long, silent build/test command is
 	// never mistaken for a wedge and aborted mid-run.
 	safeOn("tool_execution_start", () => {

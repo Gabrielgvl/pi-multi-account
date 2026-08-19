@@ -96,6 +96,7 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 | `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
 | `next` | Manually switch to the next fallback, deliberately overriding recorded cooldowns. |
+| `only-active [on\|off]` | Narrow `/model` to the active rotation account: every other provider's models are hidden (its auth is preserved) and restored on switch or `off`. Alias: `focus`. |
 | `stop` | Abort and cancel automatic failover/resume for the current task. |
 | `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
 | `reload` | Reload config from disk and re-discover accounts. |

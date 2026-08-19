@@ -187,6 +187,7 @@ function setup(opts: {
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
+		registrations: [] as Array<{ provider: string; models: number | undefined }>,
 		aborts: 0,
 		authReloads: 0,
 	};
@@ -278,6 +279,10 @@ function setup(opts: {
 		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
 			known.add(name);
 			providerConfigs.set(name, providerConfig);
+			rec.registrations.push({
+				provider: name,
+				models: providerConfig?.models?.length,
+			});
 			if (providerConfig?.models) {
 				registeredModels.set(
 					name,
@@ -2495,6 +2500,90 @@ test("add kimi points at the interactive subscription login, not a manual api ke
 		notice,
 		/auth\.json/,
 		"Kimi has a device-code OAuth flow; telling the user to paste an API key by hand was the bug",
+	);
+});
+
+test("only-active narrows /model to the active account and persists", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active on");
+	const codex = [...t.rec.registrations]
+		.reverse()
+		.find((r) => r.provider === "openai-codex-account-2");
+	assert.equal(codex?.models, 0, "the inactive codex slot must be hidden");
+	const anthropic = [...t.rec.registrations]
+		.reverse()
+		.find((r) => r.provider === "anthropic");
+	assert.notEqual(anthropic?.models, 0, "the active provider keeps its models");
+	const cfg = JSON.parse(readFileSync(CONFIG, "utf8"));
+	assert.equal(cfg.onlyActive, true, "the flag must survive restarts via config");
+	assert.ok(t.rec.notifies.at(-1)?.includes("only-active ON"));
+});
+
+test("failover under only-active unhides the target before switching and re-narrows after", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active on");
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	const lastSwitch = t.rec.setModels.at(-1) ?? "";
+	assert.ok(
+		lastSwitch.startsWith("openai-codex-account-2/"),
+		`the failover must still reach the hidden account, got ${lastSwitch}`,
+	);
+	const codex = [...t.rec.registrations]
+		.reverse()
+		.find((r) => r.provider === "openai-codex-account-2");
+	assert.ok(
+		(codex?.models ?? 0) > 0,
+		"the new active account must be visible in /model again",
+	);
+	const anthropic = [...t.rec.registrations]
+		.reverse()
+		.find((r) => r.provider === "anthropic");
+	assert.equal(anthropic?.models, 0, "the spent account leaves /model");
+});
+
+test("only-active off restores every hidden provider", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active"); // toggle on
+	assert.ok(t.rec.notifies.at(-1)?.includes("only-active ON"));
+	await t.command("only-active"); // toggle back off
+	assert.ok(t.rec.notifies.at(-1)?.includes("only-active OFF"));
+	const codex = [...t.rec.registrations]
+		.reverse()
+		.find((r) => r.provider === "openai-codex-account-2");
+	assert.ok(
+		(codex?.models ?? 0) > 0,
+		"the hidden account's models must be restored",
+	);
+	const cfg = JSON.parse(readFileSync(CONFIG, "utf8"));
+	assert.equal(cfg.onlyActive, false);
+});
+
+test("only-active re-apply on message_start is a no-op when nothing changed", async () => {
+	const t = setup({
+		accounts: TWO_ACCOUNTS,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active on");
+	const before = t.rec.registrations.length;
+	await t.fire("message_start", {});
+	await t.fire("message_start", {});
+	assert.equal(
+		t.rec.registrations.length,
+		before,
+		"a steady registry must not be re-registered on every turn",
 	);
 });
 
