@@ -4391,6 +4391,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				rejectDuplicateLogin: (slot, creds) => rejectDuplicateLogin(slot, creds),
 				slotIds,
 				notify: (message, level) => ctx?.ui?.notify?.(message, level),
+				log: (kind, data) => logEvent(kind, data),
 			});
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);

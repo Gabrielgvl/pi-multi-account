@@ -111,6 +111,8 @@ export async function setupCursorSubscription(
 		rejectDuplicateLogin?: (slot: string, creds: AuthEntry) => AuthEntry;
 		slotIds: string[];
 		notify?: (message: string, level: "info" | "warning") => void;
+		/** Structured black-box logging; the host decides where it goes. */
+		log?: (kind: string, data: Record<string, unknown>) => void;
 	},
 ): Promise<number | undefined> {
 	const mod = await loadCursorModules();
@@ -146,25 +148,42 @@ export async function setupCursorSubscription(
 	// login already discovered is gone. Read it once here instead, from the first slot
 	// whose stored token answers, and re-register every slot with it.
 	void (async () => {
-		if (typeof mod.discoverCursorModels !== "function") return;
+		if (typeof mod.discoverCursorModels !== "function") {
+			options.log?.("cursor_catalog", { outcome: "unsupported" });
+			return;
+		}
 		for (const id of ids) {
 			const entry = options.readAuth()[id];
 			if (!entry || entry.type !== "oauth" || !entry.access) continue;
 			try {
 				const models = await mod.discoverCursorModels(entry.access);
-				if (!models?.length) continue;
+				if (!models?.length) {
+					options.log?.("cursor_catalog", { outcome: "empty", provider: id });
+					continue;
+				}
 				for (const slot of ids) {
 					mod.registerCursorProvider(pi, slot, proxyPort!, models as any[], {
 						rejectDuplicateLogin: options.rejectDuplicateLogin,
 					});
 				}
+				options.log?.("cursor_catalog", { outcome: "discovered", provider: id, models: models.length });
 				return;
-			} catch {
+			} catch (error) {
+				options.log?.("cursor_catalog", {
+					outcome: "error",
+					provider: id,
+					reason: error instanceof Error ? error.message : String(error),
+				});
 				// This account's token could not read the catalog — try the next one.
 			}
 		}
-	})().catch(() => {
+		options.log?.("cursor_catalog", { outcome: "unavailable", reason: "no slot could read the catalog" });
+	})().catch((error) => {
 		// Discovery is best-effort; the fallback catalog is already registered.
+		options.log?.("cursor_catalog", {
+			outcome: "crashed",
+			reason: error instanceof Error ? error.message : String(error),
+		});
 	});
 	return proxyPort;
 }
