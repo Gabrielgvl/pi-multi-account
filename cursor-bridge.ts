@@ -35,6 +35,11 @@ type CursorShared = {
 	) => Promise<number>;
 	registerCursorProvider: (...args: any[]) => void;
 	FALLBACK_MODELS: unknown[];
+	/**
+	 * Optional: read an account's real catalog. Older clones lack it — startup then
+	 * keeps the fallback list until the next login/refresh, exactly as before.
+	 */
+	discoverCursorModels?: (accessToken: string) => Promise<unknown[]>;
 };
 type CursorIndex = { registerSessionLifecycleCleanup?: (pi: ExtensionAPI) => void };
 
@@ -136,6 +141,31 @@ export async function setupCursorSubscription(
 			},
 		});
 	}
+	// Slots registered above start on FALLBACK_MODELS. A logged-in account would keep
+	// that stale short list until its next token refresh — restart Pi and a catalog the
+	// login already discovered is gone. Read it once here instead, from the first slot
+	// whose stored token answers, and re-register every slot with it.
+	void (async () => {
+		if (typeof mod.discoverCursorModels !== "function") return;
+		for (const id of ids) {
+			const entry = options.readAuth()[id];
+			if (!entry || entry.type !== "oauth" || !entry.access) continue;
+			try {
+				const models = await mod.discoverCursorModels(entry.access);
+				if (!models?.length) continue;
+				for (const slot of ids) {
+					mod.registerCursorProvider(pi, slot, proxyPort!, models as any[], {
+						rejectDuplicateLogin: options.rejectDuplicateLogin,
+					});
+				}
+				return;
+			} catch {
+				// This account's token could not read the catalog — try the next one.
+			}
+		}
+	})().catch(() => {
+		// Discovery is best-effort; the fallback catalog is already registered.
+	});
 	return proxyPort;
 }
 
