@@ -1,14 +1,9 @@
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const AGENT_DIR =
-	process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-const CURSOR_PROVIDER_ROOT =
-	process.env.PI_CURSOR_PROVIDER_ROOT ||
-	join(AGENT_DIR, "git/github.com/ndraiman/pi-cursor-provider");
+const VENDORED_CURSOR_ROOT = join(dirname(fileURLToPath(import.meta.url)), "cursor");
 
 export const CURSOR_BASE = "cursor";
 
@@ -17,16 +12,19 @@ export function isCursorProviderId(id: string): boolean {
 }
 
 /**
- * Whether the (separately cloned) Cursor provider is present on disk.
+ * Where Cursor implementation is loaded from.
  *
- * `includeCursor` defaults to true, but the provider itself is an optional external
- * repo. Without this check the extension registered a `cursor-account-2` login slot
- * backed by nothing and warned about a `git clone` at every start — noise for the
- * majority of users who never asked for Cursor. Cheap enough (one existsSync) to call
- * on every discovery pass, and it picks up a later clone without a restart.
+ * Production always uses the copy vendored next to this file (`./cursor`).
+ * `PI_CURSOR_PROVIDER_ROOT` is a test seam only: the suite points it at a stub
+ * or an empty directory so it can exercise load failures without starting the
+ * real proxy.
  */
+export function getCursorProviderRoot(): string {
+	return process.env.PI_CURSOR_PROVIDER_ROOT || VENDORED_CURSOR_ROOT;
+}
+
 export function isCursorProviderInstalled(): boolean {
-	return existsSync(join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts"));
+	return existsSync(join(getCursorProviderRoot(), "cursor-shared.ts"));
 }
 
 type CursorShared = {
@@ -35,10 +33,6 @@ type CursorShared = {
 	) => Promise<number>;
 	registerCursorProvider: (...args: any[]) => void;
 	FALLBACK_MODELS: unknown[];
-	/**
-	 * Optional: read an account's real catalog. Older clones lack it — startup then
-	 * keeps the fallback list until the next login/refresh, exactly as before.
-	 */
 	discoverCursorModels?: (accessToken: string) => Promise<unknown[]>;
 };
 type CursorIndex = { registerSessionLifecycleCleanup?: (pi: ExtensionAPI) => void };
@@ -48,11 +42,6 @@ let indexMod: CursorIndex | undefined;
 let proxyPort: number | undefined;
 let loadAttempt = 0;
 
-/**
- * A module that threw during evaluation stays cached as FAILED under its own URL, so a plain
- * re-import would replay the original error forever. Only the retry path pays for a fresh
- * instance, and only after the previous one proved unusable.
- */
 function loadSpecifier(entry: string): string {
 	return loadAttempt === 0
 		? entry
@@ -71,13 +60,13 @@ function loadSpecifier(entry: string): string {
  */
 async function loadCursorModules(): Promise<CursorShared | undefined> {
 	sharedModPromise ??= (async () => {
-		const entry = join(CURSOR_PROVIDER_ROOT, "cursor-shared.ts");
+		const entry = join(getCursorProviderRoot(), "cursor-shared.ts");
 		if (!existsSync(entry)) return undefined;
 		try {
 			const shared = (await import(
 				/* @vite-ignore */ loadSpecifier(entry)
 			)) as CursorShared;
-			const indexEntry = join(CURSOR_PROVIDER_ROOT, "index.ts");
+			const indexEntry = join(getCursorProviderRoot(), "index.ts");
 			if (existsSync(indexEntry)) {
 				indexMod = (await import(
 					/* @vite-ignore */ loadSpecifier(indexEntry)
@@ -85,8 +74,6 @@ async function loadCursorModules(): Promise<CursorShared | undefined> {
 			}
 			return shared;
 		} catch (error) {
-			// A failed import must not poison the cache forever: a user who fixes the clone
-			// (or clones it at all) gets a fresh attempt on the next discovery pass.
 			sharedModPromise = undefined;
 			loadAttempt++;
 			throw error;
@@ -111,14 +98,20 @@ export async function setupCursorSubscription(
 		rejectDuplicateLogin?: (slot: string, creds: AuthEntry) => AuthEntry;
 		slotIds: string[];
 		notify?: (message: string, level: "info" | "warning") => void;
-		/** Structured black-box logging; the host decides where it goes. */
 		log?: (kind: string, data: Record<string, unknown>) => void;
+		/**
+		 * Host hook: provision each Cursor slot into Pi's static models.json so a
+		 * bare `pi -p` child (no extensions) resolves cursor/* through the running
+		 * proxy. Called after the proxy is up and again when the real catalog lands.
+		 * Pass model objects (or ids); the host writes Pi-schema objects, never strings.
+		 */
+		onProvision?: (slotIds: string[], port: number, models: unknown[]) => void;
 	},
 ): Promise<number | undefined> {
 	const mod = await loadCursorModules();
 	if (!mod) {
 		options.notify?.(
-			`pi-multi-account: Cursor subscription support not found at ${CURSOR_PROVIDER_ROOT}. Run: git clone https://github.com/ndraiman/pi-cursor-provider ${CURSOR_PROVIDER_ROOT}`,
+			`pi-multi-account: Cursor support is missing from this install (expected ${getCursorProviderRoot()}). Everything else keeps working; set "includeCursor": false in the config to silence this.`,
 			"warning",
 		);
 		return undefined;
@@ -133,6 +126,7 @@ export async function setupCursorSubscription(
 	};
 	proxyPort = await mod.ensureCursorProxy(resolveAccessToken);
 	const ids = [...new Set([CURSOR_BASE, ...options.slotIds])];
+	options.onProvision?.(ids, proxyPort, mod.FALLBACK_MODELS as unknown[]);
 	for (const id of ids) {
 		mod.registerCursorProvider(pi, id, proxyPort, mod.FALLBACK_MODELS, {
 			rejectDuplicateLogin: options.rejectDuplicateLogin,
@@ -140,13 +134,10 @@ export async function setupCursorSubscription(
 				mod.registerCursorProvider(pi, id, proxyPort!, models as any[], {
 					rejectDuplicateLogin: options.rejectDuplicateLogin,
 				});
+				options.onProvision?.(ids, proxyPort!, models);
 			},
 		});
 	}
-	// Slots registered above start on FALLBACK_MODELS. A logged-in account would keep
-	// that stale short list until its next token refresh — restart Pi and a catalog the
-	// login already discovered is gone. Read it once here instead, from the first slot
-	// whose stored token answers, and re-register every slot with it.
 	void (async () => {
 		if (typeof mod.discoverCursorModels !== "function") {
 			options.log?.("cursor_catalog", { outcome: "unsupported" });
@@ -166,7 +157,12 @@ export async function setupCursorSubscription(
 						rejectDuplicateLogin: options.rejectDuplicateLogin,
 					});
 				}
-				options.log?.("cursor_catalog", { outcome: "discovered", provider: id, models: models.length });
+				options.onProvision?.(ids, proxyPort!, models as unknown[]);
+				options.log?.("cursor_catalog", {
+					outcome: "discovered",
+					provider: id,
+					models: models.length,
+				});
 				return;
 			} catch (error) {
 				options.log?.("cursor_catalog", {
@@ -174,20 +170,17 @@ export async function setupCursorSubscription(
 					provider: id,
 					reason: error instanceof Error ? error.message : String(error),
 				});
-				// This account's token could not read the catalog — try the next one.
 			}
 		}
-		options.log?.("cursor_catalog", { outcome: "unavailable", reason: "no slot could read the catalog" });
+		options.log?.("cursor_catalog", {
+			outcome: "unavailable",
+			reason: "no slot could read the catalog",
+		});
 	})().catch((error) => {
-		// Discovery is best-effort; the fallback catalog is already registered.
 		options.log?.("cursor_catalog", {
 			outcome: "crashed",
 			reason: error instanceof Error ? error.message : String(error),
 		});
 	});
 	return proxyPort;
-}
-
-export function getCursorProviderRoot(): string {
-	return CURSOR_PROVIDER_ROOT;
 }

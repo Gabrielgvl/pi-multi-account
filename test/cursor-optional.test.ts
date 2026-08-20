@@ -97,7 +97,7 @@ console.log("__RESULT__" + JSON.stringify({
 	modelCounts,
 	sessionStartCompleted: notifies.some((m) => m.includes("loaded")),
 	pendingFromAfter: state.pendingFrom,
-	cursorNotices: notifies.filter((m) => m.includes("Cursor provider at")).length,
+	cursorNotices: notifies.filter((m) => /Cursor/.test(m) && /failed to load/.test(m)).length,
 	loggedFailure: log.some((e) => e.kind === "cursor_setup_failed"),
 	rejections,
 }));

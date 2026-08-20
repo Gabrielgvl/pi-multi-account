@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -26,6 +27,7 @@ const CURSOR_ROOT = join(AGENT_DIR, "cursor-provider");
 process.env.PI_CURSOR_PROVIDER_ROOT = CURSOR_ROOT;
 
 const CURSOR_PROVIDER_STUB = `export const FALLBACK_MODELS = [
+	{ id: "cursor-grok-4.6", name: "Grok 4.6", reasoning: true, input: ["text"] },
 	{ id: "composer-2.5", name: "Composer 2.5", reasoning: true, input: ["text"] },
 ];
 export async function ensureCursorProxy() {
@@ -49,16 +51,35 @@ function uninstallCursorProvider() {
 // that case needs a fresh process, because the cursor bridge caches the loaded module and an
 // earlier test in this file loads a working stub.
 
-const { default: piMultiAccount, mergeRefreshedCredentials } = (await import(
-	"../index.ts"
-)) as {
+const {
+	default: piMultiAccount,
+	mergeRefreshedCredentials,
+	modelIdentityKey,
+	sameModelIdentity,
+} = (await import("../index.ts")) as {
 	default: (pi: any) => void;
 	mergeRefreshedCredentials: (credentials: any, refreshed: any) => any;
+	modelIdentityKey: (modelId: string) => string;
+	sameModelIdentity: (a: string | undefined, b: string | undefined) => boolean;
 };
+
+test("model identity folds Cursor effort suffixes and the cursor- prefix", () => {
+	assert.equal(modelIdentityKey("cursor-grok-4.6-high"), "grok-4.6");
+	assert.equal(modelIdentityKey("cursor-grok-4.6"), "grok-4.6");
+	assert.equal(modelIdentityKey("grok-4.6"), "grok-4.6");
+	assert.equal(modelIdentityKey("cursor-grok-4.6-high-fast"), "grok-4.6");
+	assert.ok(sameModelIdentity("cursor-grok-4.6-high", "cursor-grok-4.6"));
+	assert.ok(sameModelIdentity("cursor-grok-4.6-high", "grok-4.6"));
+	assert.ok(!sameModelIdentity("cursor-grok-4.6", "claude-4-sonnet"));
+	assert.ok(!sameModelIdentity("gpt-5.4", "gpt-5.4-mini"));
+	assert.ok(!sameModelIdentity("k3", "k3-256k"));
+});
 
 const AUTH = join(AGENT_DIR, "auth.json");
 const CONFIG = join(AGENT_DIR, "provider-failover.json");
 const STATE = join(AGENT_DIR, "provider-failover-state.json");
+const SETTINGS = join(AGENT_DIR, "settings.json");
+const MODELS = join(AGENT_DIR, "models.json");
 const DEBUG_LOG = join(AGENT_DIR, "provider-failover-debug.log");
 
 function readDebugLog(): Array<Record<string, any>> {
@@ -135,6 +156,8 @@ function setup(opts: {
 	thinkingLevel?: string;
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
 	thinkingCaps?: Record<string, string>;
+	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
+	settings?: { defaultProvider: string; defaultModel: string };
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -171,6 +194,11 @@ function setup(opts: {
 		);
 	} else {
 		rmSync(STATE, { force: true });
+	}
+	if (opts.settings) {
+		writeFileSync(SETTINGS, JSON.stringify(opts.settings));
+	} else {
+		rmSync(SETTINGS, { force: true });
 	}
 
 	const known = new Set<string>(
@@ -2484,6 +2512,211 @@ test("a Kimi subscription slot is registered so /login can offer it", async () =
 	);
 });
 
+test("session_start restores lastUserModel after Pi falls back to anthropic/claude-opus-4-8", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { includeCursor: true, fallbacks: ["anthropic", "cursor"] },
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastModelByFamily: { cursor: "cursor-grok-4.6" },
+			exhaustedUntilByProvider: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(
+		t.ctx.model,
+		{ provider: "cursor", id: "cursor-grok-4.6" },
+		`startup must put the session back on the last live model, not Pi's anthropic default; setModels=${t.rec.setModels.join(",")}`,
+	);
+	uninstallCursorProvider();
+});
+
+test("session_start restores settings.json default when lastUserModel is missing", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { includeCursor: true, fallbacks: ["anthropic", "cursor"] },
+		settings: {
+			defaultProvider: "cursor",
+			defaultModel: "cursor-grok-4.6",
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(
+		t.ctx.model,
+		{ provider: "cursor", id: "cursor-grok-4.6" },
+		`settings.json default must win over Pi's anthropic fallback; setModels=${t.rec.setModels.join(",")}`,
+	);
+	uninstallCursorProvider();
+});
+
+test("startup preflight restores lastUserModel instead of failing over Pi's accidental kimi fallback", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k", refresh: "kr" },
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "kimi-coding", id: "k3" },
+		config: {
+			includeCursor: true,
+			fallbacks: ["kimi-coding", "anthropic", "cursor"],
+		},
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastModelByFamily: { cursor: "cursor-grok-4.6" },
+			exhaustedUntilByProvider: { "kimi-coding": Date.now() + 60 * 60 * 1000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(
+		t.ctx.model,
+		{ provider: "cursor", id: "cursor-grok-4.6" },
+		`kimi-on-cooldown must not steal startup; Pi's fallback is not the user's model; setModels=${t.rec.setModels.join(",")}`,
+	);
+	uninstallCursorProvider();
+});
+
+test("a state-version migration still remembers the last live model", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { includeCursor: true, fallbacks: ["anthropic", "cursor"] },
+		seedState: {
+			stateVersion: 3,
+			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastModelByFamily: { cursor: "cursor-grok-4.6" },
+			exhaustedUntilByProvider: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(
+		t.ctx.model,
+		{ provider: "cursor", id: "cursor-grok-4.6" },
+		`migrating state must keep lastUserModel; setModels=${t.rec.setModels.join(",")}`,
+	);
+	uninstallCursorProvider();
+});
+
+test("a logged-in kimi slot is provisioned into models.json so bare children resolve it natively", async () => {
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k", refresh: "kr" },
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+		},
+	});
+	await t.fire("session_start");
+	const modelsJson = JSON.parse(readFileSync(MODELS, "utf8"));
+	const slot = modelsJson.providers?.["kimi-coding-account-2"];
+	assert.ok(slot, "kimi-coding-account-2 must be provisioned into models.json");
+	assert.equal(slot.api, "anthropic-messages");
+	assert.equal(slot.baseUrl, "https://api.kimi.com/coding");
+	assert.ok(
+		Array.isArray(slot.models) &&
+			slot.models.every(
+				(model: unknown) =>
+					!!model &&
+					typeof model === "object" &&
+					typeof (model as { id?: unknown }).id === "string",
+			),
+		"Pi's models.json schema requires model objects, not string ids",
+	);
+	assert.ok(slot.models.some((model: { id: string }) => model.id === "k3"));
+	// settings.json untouched — Pi owns defaults; we only provision resolution data.
+	assert.equal(existsSync(SETTINGS), false);
+});
+
+test("string model ids already in models.json are rewritten as objects", async () => {
+	writeFileSync(
+		MODELS,
+		JSON.stringify({
+			providers: {
+				"kimi-coding-account-2": {
+					api: "anthropic-messages",
+					baseUrl: "https://api.kimi.com/coding",
+					models: ["k3", "k3-256k"],
+				},
+			},
+		}),
+	);
+	const t = setup({
+		accounts: {
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+		},
+	});
+	await t.fire("session_start");
+	const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers[
+		"kimi-coding-account-2"
+	];
+	assert.ok(
+		slot.models.every(
+			(model: unknown) =>
+				!!model &&
+				typeof model === "object" &&
+				typeof (model as { id?: unknown }).id === "string",
+		),
+	);
+	assert.ok(slot.models.some((model: { id: string }) => model.id === "k3"));
+});
+
+test("a failover switch never rewrites settings.json — the user's base config stays in base form", async () => {
+	const t = setup({
+		accounts: {
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+		},
+		current: { provider: "kimi-coding-account-2", id: "k3" },
+		settings: { defaultProvider: "cursor", defaultModel: "cursor-grok-4.6" },
+	});
+	await t.fire("model_select", {
+		model: { provider: "kimi-coding-account-2", id: "k3" },
+	});
+	const settings = JSON.parse(readFileSync(SETTINGS, "utf8"));
+	assert.equal(settings.defaultProvider, "cursor");
+	assert.equal(settings.defaultModel, "cursor-grok-4.6");
+});
+
+test("session_shutdown remembers the live model so the next start can restore it", async () => {
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "c", refresh: "cr" },
+		},
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+	});
+	await t.fire("session_shutdown");
+	const state = t.readState();
+	assert.deepEqual(state.lastUserModel, {
+		provider: "cursor",
+		id: "cursor-grok-4.6",
+	});
+	assert.equal(state.lastModelByFamily?.cursor, "cursor-grok-4.6");
+});
+
 test("add kimi points at the interactive subscription login, not a manual api key", async () => {
 	const t = setup({
 		accounts: {
@@ -3625,6 +3858,128 @@ test("failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded bac
 		!t.rec.setModels.some((m) => m.endsWith("/gpt-5.4")),
 		"must not carry the downgraded gpt-5.4 forward",
 	);
+});
+
+test("exhausted account fails over to a sibling with the same model before any other family", async () => {
+	// Live log 2026-08-19: kimi-coding-account-2/k3 exhausted → anthropic-account-2/claude-opus-5
+	// because confirmation and preferLatestModel ranked across families. Anthropic is FIRST in
+	// the ring so only same-identity ranking can save this.
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "kimi-coding-account-2", id: "k3" },
+		thinkingLevel: "high",
+		config: { providerOrder: ["anthropic", "kimi-coding"] },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"kimi-coding-account-2",
+		"k3",
+		"429 rate_limit_error",
+	);
+	assert.equal(
+		t.rec.setModels[0],
+		"kimi-coding/k3",
+		`must take the other Kimi slot at k3, not a random family flagship; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("anthropic")),
+		`must not jump to Claude while a Kimi sibling can take k3; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(
+		t.thinkingLevel(),
+		"high",
+		"the session thinking level must survive the sibling switch",
+	);
+});
+
+test("a cooling same-model sibling yields to another family", async () => {
+	const t = setup({
+		accounts: {
+			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
+			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "kimi-coding-account-2", id: "k3" },
+		seedCooldownsMsFromNow: { "kimi-coding": 3_600_000 },
+	});
+	await finishError(
+		t,
+		"kimi-coding-account-2",
+		"k3",
+		"429 rate_limit_error",
+	);
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("anthropic/")),
+		`with the only k3 sibling cooling, another family must take over; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("kimi-coding/")),
+		`must not land on the cooling sibling; got ${t.rec.setModels.join(", ")}`,
+	);
+});
+
+test("cursor failover keeps grok and thinking level instead of jumping to another family", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+			"cursor-account-2": { type: "oauth", access: "c2", refresh: "cr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "cursor-account-2", id: "cursor-grok-4.6" },
+		thinkingLevel: "high",
+		config: { includeCursor: true, providerOrder: ["anthropic", "cursor"] },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"cursor-account-2",
+		"cursor-grok-4.6",
+		"429 rate_limit_error",
+	);
+	assert.equal(
+		t.rec.setModels[0],
+		"cursor/cursor-grok-4.6",
+		`must take the other Cursor slot at grok, not Claude; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(t.thinkingLevel(), "high");
+	uninstallCursorProvider();
+});
+
+test("cursor-grok-4.6-high on one account matches folded grok on a sibling", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "c1", refresh: "cr1" },
+			"cursor-account-2": { type: "oauth", access: "c2", refresh: "cr2" },
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "cursor-account-2", id: "cursor-grok-4.6-high" },
+		thinkingLevel: "high",
+		config: { includeCursor: true, providerOrder: ["anthropic", "cursor"] },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"cursor-account-2",
+		"cursor-grok-4.6-high",
+		"429 rate_limit_error",
+	);
+	assert.equal(
+		t.rec.setModels[0],
+		"cursor/cursor-grok-4.6",
+		`effort suffix is the thinking level, not a different model; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(t.thinkingLevel(), "high");
+	uninstallCursorProvider();
 });
 
 // ---------------------------------------------------------------------------

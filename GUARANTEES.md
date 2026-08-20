@@ -1,7 +1,7 @@
 # What "working" means — and what locks it
 
 This file is the contract. Each row is a promise the extension makes, written in plain language,
-next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (134 tests)
+next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (226 tests)
 runs them all; CI blocks any change that violates a promise. If you hit a behaviour that feels
 broken and it is **not** on this list, that is a missing guarantee — it should become a new row +
 test, not a one-off patch.
@@ -41,6 +41,8 @@ test, not a one-off patch.
 | 26 | **A provider's forecast never parks an account.** Reset timestamps and used-percentages are predictions — providers refresh quota windows early and unannounced, and resize the windows themselves — so no cooldown, reset time or usage reading keeps an account from being tried again for longer than `maxRecheckIntervalMs` (default 10 min). Forecasts still order the queue: an account nothing predicts as spent is tried first, and among equals the one that refused longest ago wins. | `a month-long quota forecast cannot park an account past the recheck ceiling` · `once the recheck ceiling elapses, an untried account still outranks one that refused` · `a spent account known ONLY from a STALE usage snapshot ... is still benched` · `a genuinely maxed monthly Codex account is benched for its REAL reset ...` |
 
 | 27 | **Every thinking level a model advertises is available — and none that it doesn't.** `max` is offered on models that advertise it (GPT-5.6 Sol/Terra/Luna do) and accepted as an explicit `reasoningLevel`, restored after a switch like any other level. The known-levels list is a filter, never a grant: provider gradations differ wildly and do not nest, so what a model gets comes from its own advertised efforts. | `a model that advertises max gets max — and one that does not, does not` · `reasoningLevel: max is honoured instead of being silently dropped to auto` · `max survives a switch through a weaker model, exactly like every other level` |
+
+| 28 | **An exhausted account first fails over to a sibling with the same model and thinking level** — not to a random flagship of another family. Only when no sibling can take that model does rotation leave the family. Effort-folded Cursor ids (`cursor-grok-4.6-high` ≈ `cursor-grok-4.6`) count as the same model. Same-family flagship upgrades (gpt-5.4 → gpt-5.5) still happen. | `exhausted account fails over to a sibling with the same model before any other family` · `a cooling same-model sibling yields to another family` · `cursor failover keeps grok and thinking level instead of jumping to another family` · `cursor-grok-4.6-high on one account matches folded grok on a sibling` · `failover prefers the latest model: a turn stuck on gpt-5.4 is upgraded back to gpt-5.5 on a codex→codex switch` |
 
 ## How to keep this honest
 

@@ -19,7 +19,7 @@ if (leaked.length) throw new Error(`Refusing non-public package artifacts: ${lea
 for (const required of ["package.json", "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md", "index.ts"]) {
 	if (!names.includes(required)) throw new Error(`npm package is missing ${required}`);
 }
-if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 512 * 1024) {
+if (!Number.isSafeInteger(packed[0].unpackedSize) || packed[0].unpackedSize > 2 * 1024 * 1024) {
 	throw new Error(`npm package is unexpectedly large: ${packed[0].unpackedSize}`);
 }
 // `const VERSION` in index.ts is what the runtime reports — startup notices, the

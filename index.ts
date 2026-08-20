@@ -41,7 +41,6 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_BASE,
-	getCursorProviderRoot,
 	isCursorProviderId,
 	isCursorProviderInstalled,
 	setupCursorSubscription,
@@ -603,6 +602,12 @@ type ProviderFailoverState = {
 	pendingSince?: number;
 	pendingReason?: string;
 	lastSwitches?: SwitchRecord[];
+	/** Last model the user was actually on (failover destination included). Restored after catalogs load. */
+	lastUserModel?: { provider: string; id: string };
+	/** Thinking level the session ran at (high/max/…). Pi clamps it to the fallback model's caps at restore time, so persist and re-assert after the model is back. */
+	lastUserThinkingLevel?: string;
+	/** Last chosen model id per family, so /next into that family does not land on the baked-in fallback. */
+	lastModelByFamily?: Record<string, string>;
 };
 
 const AGENT_DIR =
@@ -611,6 +616,7 @@ const CONFIG_PATH = join(AGENT_DIR, "provider-failover.json");
 const STATE_PATH = join(AGENT_DIR, "provider-failover-state.json");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
 const MODELS_CONFIG_PATH = join(AGENT_DIR, "models.json");
+const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 /**
  * Model ids the user configured for a provider in Pi's own models.json.
@@ -635,6 +641,163 @@ function configuredModelIds(provider: string): string[] {
 		return [];
 	}
 }
+
+function readHostDefaultModel(): { provider: string; id: string } | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
+		const provider = parsed?.defaultProvider;
+		const id = parsed?.defaultModel;
+		if (
+			typeof provider === "string" &&
+			provider &&
+			typeof id === "string" &&
+			id
+		) {
+			return { provider, id };
+		}
+	} catch {
+		/* settings.json is optional */
+	}
+	return undefined;
+}
+
+type NativeModelEntry = {
+	id: string;
+	name?: string;
+	api?: string;
+	baseUrl?: string;
+	reasoning?: boolean;
+	thinkingLevelMap?: Record<string, string | null>;
+	input?: Array<"text" | "image">;
+	cost?: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+	};
+	contextWindow?: number;
+	maxTokens?: number;
+	compat?: Record<string, unknown>;
+};
+
+type NativeProviderEntry = {
+	api: string;
+	baseUrl: string;
+	models: unknown[];
+	compat?: Record<string, unknown>;
+};
+
+/**
+ * Pi's models.json schema is `models: ModelDefinition[]` — each entry MUST be an
+ * object with `id`. A string id (`"k3"`) fails validation, and Pi then discards
+ * the *entire* file (every custom provider, not just the bad slot).
+ */
+function nativeModelEntry(model: unknown): NativeModelEntry | undefined {
+	if (typeof model === "string") {
+		return model.length > 0 ? { id: model } : undefined;
+	}
+	if (!model || typeof model !== "object") return undefined;
+	const rec = model as Record<string, unknown>;
+	const id = typeof rec.id === "string" ? rec.id : "";
+	if (!id) return undefined;
+	const entry: NativeModelEntry = { id };
+	if (typeof rec.name === "string" && rec.name.length > 0) entry.name = rec.name;
+	if (typeof rec.api === "string" && rec.api.length > 0) entry.api = rec.api;
+	if (typeof rec.baseUrl === "string" && rec.baseUrl.length > 0) {
+		entry.baseUrl = rec.baseUrl;
+	}
+	if (typeof rec.reasoning === "boolean") entry.reasoning = rec.reasoning;
+	if (rec.thinkingLevelMap && typeof rec.thinkingLevelMap === "object") {
+		entry.thinkingLevelMap = rec.thinkingLevelMap as NativeModelEntry["thinkingLevelMap"];
+	}
+	if (Array.isArray(rec.input)) {
+		const input = rec.input.filter(
+			(value): value is "text" | "image" => value === "text" || value === "image",
+		);
+		if (input.length) entry.input = input;
+	}
+	if (rec.cost && typeof rec.cost === "object") {
+		const cost = rec.cost as Record<string, unknown>;
+		if (
+			typeof cost.input === "number" &&
+			typeof cost.output === "number" &&
+			typeof cost.cacheRead === "number" &&
+			typeof cost.cacheWrite === "number"
+		) {
+			entry.cost = {
+				input: cost.input,
+				output: cost.output,
+				cacheRead: cost.cacheRead,
+				cacheWrite: cost.cacheWrite,
+			};
+		}
+	}
+	if (typeof rec.contextWindow === "number") entry.contextWindow = rec.contextWindow;
+	if (typeof rec.maxTokens === "number") entry.maxTokens = rec.maxTokens;
+	if (rec.compat && typeof rec.compat === "object") {
+		entry.compat = rec.compat as Record<string, unknown>;
+	}
+	return entry;
+}
+
+function nativeModelEntries(models: unknown[]): NativeModelEntry[] {
+	const out: NativeModelEntry[] = [];
+	for (const model of models) {
+		const entry = nativeModelEntry(model);
+		if (entry) out.push(entry);
+	}
+	return out;
+}
+
+/**
+ * Provision a rotation slot into Pi's OWN static provider registry (models.json)
+ * so any bare `pi -p` child resolves `kimi-coding-account-2/k3` or
+ * `cursor/cursor-grok-4.6` WITHOUT this extension loaded. Written ONLY here:
+ * at slot login/discovery — never on failover, rotation, or limit events.
+ * Failover state lives in provider-failover-state.json, our own file.
+ * Merge-only: existing user entries and unrelated keys are preserved verbatim.
+ */
+function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void {
+	try {
+		const models = nativeModelEntries(entry.models);
+		const normalized: Record<string, unknown> = {
+			api: entry.api,
+			baseUrl: entry.baseUrl,
+			models,
+		};
+		if (entry.compat) normalized.compat = entry.compat;
+		const raw = existsSync(MODELS_CONFIG_PATH)
+			? readFileSync(MODELS_CONFIG_PATH, "utf8")
+			: "{}";
+		const parsed = JSON.parse(raw);
+		const providers =
+			typeof parsed?.providers === "object" && parsed.providers !== null
+				? parsed.providers
+				: {};
+		const existing = providers[provider];
+		if (
+			existing?.baseUrl === normalized.baseUrl &&
+			existing?.api === normalized.api &&
+			JSON.stringify(existing?.models ?? []) === JSON.stringify(models)
+		) {
+			return; // already provisioned — do not touch the file
+		}
+		const next = {
+			...parsed,
+			providers: { ...providers, [provider]: normalized },
+		};
+		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}
+`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		renameSync(tmp, MODELS_CONFIG_PATH);
+	} catch {
+		/* models.json locked/corrupt — the extension registry still works */
+	}
+}
+
 // "Black box" flight recorder: a structured, append-only log of every decision the
 // extension makes (switches, errors, watchdog actions, breaker trips, compaction
 // routing). When something misbehaves, this file is the exact reproduction trail —
@@ -699,7 +862,7 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // Bumped on every release. Printed at startup and in `/multi-account status` so you can verify
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
-const VERSION = "1.19.2";
+const VERSION = "1.19.3";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -1181,7 +1344,7 @@ const DEFAULT_ANTHROPIC_MODELS = [
 
 const DEFAULT_OLLAMA_MODELS = ["glm-5.2:cloud"];
 const DEFAULT_QWEN_MODELS = ["qwen3.8-max", "qwen-max", "qwen-plus"];
-const DEFAULT_CURSOR_MODELS = ["composer-2.5"];
+const DEFAULT_CURSOR_MODELS = ["cursor-grok-4.6", "grok-4.6", "composer-2.5"];
 
 const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	enabled: true,
@@ -1454,6 +1617,10 @@ function loadState(): ProviderFailoverState {
 				lastProbeAtByProvider: state.lastProbeAtByProvider ?? {},
 				invalidatedByProvider: {},
 				lastSwitches: state.lastSwitches ?? [],
+				// A version bump must not forget which model the user was actually on.
+				lastUserModel: state.lastUserModel,
+				lastUserThinkingLevel: state.lastUserThinkingLevel,
+				lastModelByFamily: state.lastModelByFamily,
 			};
 			saveState(migrated);
 			return migrated;
@@ -1469,11 +1636,16 @@ function saveState(state: ProviderFailoverState) {
 	// state write only costs a cooldown estimate that is re-derived on the next error.
 	try {
 		mkdirSync(dirname(STATE_PATH), { recursive: true, mode: 0o700 });
+		// Atomic: a crash mid-write (the EPIPE exit already cost us lastUserModel once)
+		// must leave the PREVIOUS complete file, not a truncated JSON the next process
+		// discards wholesale.
+		const tmp = `${STATE_PATH}.tmp`;
 		writeFileSync(
-			STATE_PATH,
+			tmp,
 			`${JSON.stringify({ stateVersion: STATE_VERSION, ...state }, null, "\t")}\n`,
 			{ encoding: "utf8", mode: 0o600 },
 		);
+		renameSync(tmp, STATE_PATH);
 	} catch {
 		/* persistence is non-critical; in-memory state remains correct */
 	}
@@ -1831,6 +2003,46 @@ function parseTarget(
 	const modelId = trimmed.slice(slash + 1).trim();
 	if (!provider || !modelId) return undefined;
 	return { provider, modelId };
+}
+
+/** Effort suffixes some catalogs bake into the model id. Thinking is a session setting. */
+const MODEL_IDENTITY_EFFORTS = new Set([
+	"none",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"minimal",
+]);
+
+/**
+ * Compare models the way a person does: `cursor-grok-4.6-high` is the same model as
+ * `cursor-grok-4.6` / `grok-4.6` at a different thinking effort, not a different model.
+ */
+export function modelIdentityKey(modelId: string): string {
+	let id = modelId.trim().toLowerCase();
+	if (id.endsWith("-fast")) id = id.slice(0, -5);
+	if (id.endsWith("-thinking")) id = id.slice(0, -9);
+	const dash = id.lastIndexOf("-");
+	if (dash >= 0 && MODEL_IDENTITY_EFFORTS.has(id.slice(dash + 1))) {
+		id = id.slice(0, dash);
+	}
+	if (id.startsWith("cursor-")) id = id.slice("cursor-".length);
+	return id;
+}
+
+export function sameModelIdentity(
+	a: string | undefined,
+	b: string | undefined,
+): boolean {
+	if (!a || !b) return false;
+	return a === b || modelIdentityKey(a) === modelIdentityKey(b);
+}
+
+/** Family when we know one; otherwise the un-numbered provider id (`zai` from `zai-account-2`). */
+function accountGroup(id: string, qwenProvider: string): string {
+	return classifyProvider(id, qwenProvider) ?? id.replace(/-account-\d+$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -2807,6 +3019,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	debugLogEnabled = config.debugLog;
 	let configuredFallbacks = config.fallbacks.slice();
 	let persistedState = loadState();
+	let lastModelByFamily: Record<string, string> = {
+		...(persistedState.lastModelByFamily ?? {}),
+	};
+	/** Settles once Cursor fallback models are registered. Pi awaits the factory return, so createAgentSession can getModel(cursor, grok-4.6) instead of falling back. */
+	let cursorReady: Promise<unknown> | undefined;
 
 	// ----- only-active model filter -------------------------------------------
 	// When enabled, /model shows only the active rotation account: every other
@@ -2892,10 +3109,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * rotation could never switch INTO it.
 	 */
 	function findModelIncludingHidden(ctx: any, provider: string, modelId: string) {
-		return (
+		const direct =
 			ctx.modelRegistry.find(provider, modelId) ??
-			hiddenProviderModels.get(provider)?.find((m: any) => m.id === modelId)
-		);
+			hiddenProviderModels.get(provider)?.find((m: any) => m.id === modelId);
+		if (direct) return direct;
+		try {
+			const fromRegistry = (ctx.modelRegistry.getAll?.() ?? []).filter(
+				(m: any) => m.provider === provider,
+			);
+			const pool = [
+				...fromRegistry,
+				...(hiddenProviderModels.get(provider) ?? []),
+			];
+			const exact = pool.find((m: any) => m.id === modelId);
+			if (exact) return exact;
+			// Cursor catalogs fold effort variants (`cursor-grok-4.6-high` → `cursor-grok-4.6`).
+			// A remembered or in-flight id with the suffix must still resolve to the folded model.
+			return pool.find((m: any) => sameModelIdentity(m.id, modelId));
+		} catch {
+			return undefined;
+		}
 	}
 
 	// Clamp any persisted far-future cooldown on load: a pre-fix (or mis-parsed long-window) state
@@ -4490,6 +4723,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				slotIds,
 				notify: (message, level) => ctx?.ui?.notify?.(message, level),
 				log: (kind, data) => logEvent(kind, data),
+				onProvision: (slots, port, models) => {
+					// models.json entries point at the running proxy, so a bare child
+					// `pi -p` resolves cursor/* while any parent Pi process is alive.
+					for (const slot of slots) {
+						provisionNativeSlot(slot, {
+							api: "openai-completions",
+							baseUrl: `http://127.0.0.1:${port}/v1`,
+							models,
+						});
+					}
+				},
 			});
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
@@ -4502,7 +4746,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (!cursorSetupFailureNotified && typeof ctx?.ui?.notify === "function") {
 				cursorSetupFailureNotified = true;
 				ctx.ui.notify(
-					`pi-multi-account: the Cursor provider at ${getCursorProviderRoot()} failed to load, so Cursor accounts are unavailable this session (${reason.slice(0, 160)}). Everything else keeps working; update that provider or set "includeCursor": false in ${CONFIG_PATH} to silence this.`,
+					`pi-multi-account: built-in Cursor support failed to load, so Cursor accounts are unavailable this session (${reason.slice(0, 160)}). Everything else keeps working; set "includeCursor": false in ${CONFIG_PATH} to silence this.`,
 					"warning",
 				);
 			}
@@ -4578,18 +4822,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							: undefined,
 					);
 				} else if (family === "kimi-coding") {
-					// Built-in catalog first, then any kimi model the host already knows
-					// (e.g. a tag from models.json) so it stays selectable on the slot too.
-					registerKimiSlot(pi, id, [
+					const kimiModels = [
 						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
-					]);
+					];
+					registerKimiSlot(pi, id, kimiModels);
+					// Provision into Pi's native registry so extension-free children resolve it.
+					provisionNativeSlot(id, {
+						api: "anthropic-messages",
+						baseUrl: KIMI_BASE_URL,
+						models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
+					});
 				} else if (family === "ollama" || family === "qwen") {
 					registerApiKeySlot(pi, id, family, config.qwenProvider, ctx);
 				}
 				registeredSlots.add(id);
 			}
 		}
-		if (cursorAvailable) void refreshCursorSlots(auth);
+		if (cursorAvailable) cursorReady = refreshCursorSlots(auth);
 	}
 
 	function reloadHostAuth(ctx: any) {
@@ -4724,23 +4973,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!family) return [];
 		const configured = config.preferredModels[family];
 		if (configured && configured.length > 0) return configured;
-		return family === "anthropic"
-			? registryAnthropicModelOrder.length > 0
-				? registryAnthropicModelOrder
-				: DEFAULT_ANTHROPIC_MODELS
-			: family === "openai-codex"
-				? discoveredCodexModelOrder.length > 0
-					? discoveredCodexModelOrder
-					: registryCodexModelOrder.length > 0
-						? registryCodexModelOrder
-						: DEFAULT_CODEX_MODELS
-				: family === "ollama"
-					? DEFAULT_OLLAMA_MODELS
-					: family === "qwen"
-						? DEFAULT_QWEN_MODELS
-						: family === "cursor"
-							? DEFAULT_CURSOR_MODELS
-							: [];
+		const defaults =
+			family === "anthropic"
+				? registryAnthropicModelOrder.length > 0
+					? registryAnthropicModelOrder
+					: DEFAULT_ANTHROPIC_MODELS
+				: family === "openai-codex"
+					? discoveredCodexModelOrder.length > 0
+						? discoveredCodexModelOrder
+						: registryCodexModelOrder.length > 0
+							? registryCodexModelOrder
+							: DEFAULT_CODEX_MODELS
+					: family === "kimi-coding"
+						? DEFAULT_KIMI_MODELS
+						: family === "ollama"
+							? DEFAULT_OLLAMA_MODELS
+							: family === "qwen"
+								? DEFAULT_QWEN_MODELS
+								: family === "cursor"
+									? DEFAULT_CURSOR_MODELS
+									: [];
+		const last = lastModelByFamily[family];
+		if (!last) return defaults;
+		return [last, ...defaults.filter((id) => id !== last)];
 	}
 
 	// Rank of a model within its family's newest-first preferred order (0 = newest).
@@ -4749,7 +5004,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	function modelRecencyRank(model: any): number {
 		const family = classifyProvider(model?.provider, config.qwenProvider);
 		const order = familyPreferredModels(family);
-		const idx = order.indexOf(model?.id);
+		const idx = order.findIndex((id) => sameModelIdentity(id, model?.id));
 		return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
 	}
 
@@ -4799,9 +5054,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const seen = new Set<string>();
 		for (const modelId of modelIds) {
 			if (seen.has(modelId)) continue;
-			seen.add(modelId);
 			const model = findModelIncludingHidden(ctx, parsed.provider, modelId);
-			if (model) result.push(model);
+			if (!model) {
+				seen.add(modelId);
+				continue;
+			}
+			if (seen.has(model.id)) continue;
+			seen.add(modelId);
+			seen.add(model.id);
+			result.push(model);
 		}
 		return result;
 	}
@@ -4818,6 +5079,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			includeCurrent?: boolean;
 			manualRoundRobin?: boolean;
 			excludeProviders?: Set<string>;
+			/**
+			 * Automatic failover: try another account that still has THIS model (and family)
+			 * before jumping to a different model. `best` turns this off so confirmation still
+			 * outranks an unmeasurable sibling.
+			 */
+			preferSameIdentity?: boolean;
 		} = {},
 	) {
 		reconcileCooldownsFromUsage(ctx);
@@ -4853,6 +5120,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			 * let an unmeasurable, out-of-quota account beat a measured, confirmed one.
 			 */
 			confirmed: boolean;
+			/** Same provider family (or un-numbered base) as the account that just failed. */
+			sameFamily: boolean;
+			/** Same model identity, including effort-folded Cursor ids. */
+			sameModel: boolean;
 		};
 		// When preferLatestModel is on, the newest model wins ACROSS accounts — not just
 		// within one account. Without this, failing over from gpt-5.5 could land on the
@@ -4882,19 +5153,45 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// A provider-level usage limit never demotes the model here: the flagship stays the
 			// representative and the whole account simply cools — so we resume at the flagship, on
 			// another account, instead of quietly dropping to a weaker model of the same account.
-			const pick =
-				models.find(
-					(model: any) =>
-						(exhaustedUntilByModel.get(`${model.provider}/${model.id}`) ?? 0) <=
-						now,
-				) ?? models[0];
+			const notModelCooled = (model: any) =>
+				(exhaustedUntilByModel.get(`${model.provider}/${model.id}`) ?? 0) <= now;
+			const flagshipPick = models.find(notModelCooled) ?? models[0];
+			const currentId = currentModel?.id as string | undefined;
+			const sameFamily =
+				!!currentModel?.provider &&
+				accountGroup(models[0].provider, config.qwenProvider) ===
+					accountGroup(currentModel.provider, config.qwenProvider);
+			const identityPick =
+				options.preferSameIdentity !== false && sameFamily && currentId
+					? models.find(
+							(model: any) =>
+								notModelCooled(model) &&
+								sameModelIdentity(model.id, currentId),
+						)
+					: undefined;
+			let pick = flagshipPick;
+			if (identityPick) {
+				const flagRank = modelRecencyRank(flagshipPick);
+				const idRank = modelRecencyRank(identityPick);
+				// preferLatestModel still upgrades a known older sibling (gpt-5.4 → gpt-5.5)
+				// on a healthy account. An unranked catalog leftover (claude-4-sonnet beating
+				// grok only because it sorts first) must never steal the user's model.
+				const upgrade =
+					config.preferLatestModel &&
+					idRank !== Number.MAX_SAFE_INTEGER &&
+					flagRank < idRank;
+				pick = upgrade ? flagshipPick : identityPick;
+			}
 			// Leaving the current account: skip it (we only ever re-offer it via the round-robin
 			// wrap-around below). Excluding by the *representative* — never by the raw current
 			// model — is what stops a weaker same-account model from bubbling up as a downgrade.
+			// Equivalent ids (`cursor-grok-4.6-high` vs folded `cursor-grok-4.6`) are the same
+			// account still, so they must not look like a destination.
 			if (
 				!options.includeCurrent &&
 				pick.provider === currentModel?.provider &&
-				pick.id === currentModel?.id
+				(pick.id === currentModel?.id ||
+					sameModelIdentity(pick.id, currentModel?.id))
 			)
 				continue;
 			if (seen.has(pick.provider)) continue;
@@ -4904,6 +5201,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const providerUntil = providerRecoveryAt(pick.provider, now);
 			const modelUntil = exhaustedUntilByModel.get(key) ?? 0;
 			const remaining = Math.max(0, Math.max(providerUntil, modelUntil) - now);
+			const group = accountGroup(pick.provider, config.qwenProvider);
+			const currentGroup = currentModel?.provider
+				? accountGroup(currentModel.provider, config.qwenProvider)
+				: "";
 			scored.push({
 				model: pick,
 				remaining,
@@ -4914,6 +5215,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				predictedBusy:
 					providerRecoveryAt(pick.provider, now, { ignoreCeiling: true }) >
 					now,
+				sameFamily: !!currentGroup && group === currentGroup,
+				sameModel:
+					!!currentGroup &&
+					group === currentGroup &&
+					sameModelIdentity(pick.id, currentModel?.id),
 			});
 		}
 		if (scored.length === 0) return [];
@@ -4954,6 +5260,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// the rotation order alone could send us straight back to the account we just left, get the
 		// same refusal, and loop between two spent accounts while a live one sat further down.
 		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
+			// Exhaustion of one account must try a sibling that still has THIS model (and the
+			// session thinking level) before any other family — but only a sibling nothing
+			// predicts as spent. A Codex slot at 100% whose recheck ceiling has elapsed is
+			// selectable so we can prove the forecast stale; it must not beat a free Qwen
+			// account just because it shares a family with the one that just died.
+			(options.preferSameIdentity !== false
+				? Number(b.sameModel && !b.predictedBusy) -
+						Number(a.sameModel && !a.predictedBusy) ||
+					Number(b.sameFamily && !b.predictedBusy) -
+						Number(a.sameFamily && !a.predictedBusy)
+				: 0) ||
 			// An account the provider has CONFIRMED usable outranks one we simply know nothing
 			// about. Both look identical to a cooldown check — neither is benched — but only one
 			// carries evidence, and preferring the guess is how a switch billed as "an account
@@ -4963,6 +5280,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// because its forecast went stale — a maxed usage window is still the best hint we
 			// have about which account to ask FIRST. It just may not veto asking at all.
 			Number(a.predictedBusy) - Number(b.predictedBusy) ||
+			// Among equally-busy (or equally-free) accounts, keep preferring the same model.
+			(options.preferSameIdentity !== false
+				? Number(b.sameModel) - Number(a.sameModel) ||
+					Number(b.sameFamily) - Number(a.sameFamily)
+				: 0) ||
 			a.lastRefusalAt - b.lastRefusalAt ||
 			byRankThenRot(a, b);
 		let availableNow = scored
@@ -5223,9 +5545,101 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		);
 	}
 
+	function rememberUserModel(model: { provider?: string; id?: string } | undefined) {
+		if (!model?.provider || !model?.id) return;
+		const family = classifyProvider(model.provider, config.qwenProvider);
+		if (family) lastModelByFamily[family] = model.id;
+		persist({
+			lastUserModel: { provider: model.provider, id: model.id },
+			lastUserThinkingLevel: desiredThinkingLevel ?? readThinkingLevel(),
+			lastModelByFamily: { ...lastModelByFamily },
+		});
+	}
+
+	function intendedStartupModel(): { provider: string; id: string } | undefined {
+		const remembered = persistedState.lastUserModel;
+		if (remembered?.provider && remembered?.id) return remembered;
+		return readHostDefaultModel();
+	}
+
+	async function restoreRememberedModel(ctx: any) {
+		const intended = intendedStartupModel();
+		if (!intended) {
+			logEvent("remembered_model_skipped", { reason: "no intended model" });
+			return false;
+		}
+		const alreadyThere =
+			ctx.model?.provider === intended.provider &&
+			ctx.model?.id === intended.id;
+		if (alreadyThere) {
+			restoreDesiredThinking(ctx);
+			return true;
+		}
+		if (cursorReady) {
+			await cursorReady.catch(() => undefined);
+		}
+		let found = findModelIncludingHidden(
+			ctx,
+			intended.provider,
+			intended.id,
+		);
+		if (!found || !providerHasUsableAuth(ctx, intended.provider)) {
+			logEvent("remembered_model_unavailable", {
+				provider: intended.provider,
+				model: intended.id,
+				reason: !found ? "not in registry" : "no auth",
+			});
+			return false;
+		}
+		const from =
+			ctx.model?.provider && ctx.model?.id
+				? ref(ctx.model.provider, ctx.model.id)
+				: "none";
+		const to = ref(intended.provider, intended.id);
+		automaticModelTarget = to;
+		let ok = false;
+		try {
+			ok = await setModelEnsuringVisible(found, ctx);
+		} catch {
+			ok = false;
+		}
+		if (automaticModelTarget === to) automaticModelTarget = undefined;
+		logEvent("remembered_model_restored", {
+			from,
+			to,
+			ok,
+			source: persistedState.lastUserModel ? "state" : "settings",
+		});
+		if (ok) {
+			// Restore the user's level too — Pi clamped it to the fallback model's caps
+			// while creating the session.
+			const rememberedLevel = persistedState.lastUserThinkingLevel;
+			if (rememberedLevel) {
+				desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+			}
+			restoreDesiredThinking(ctx);
+			ctx.ui?.notify?.(
+				`pi-multi-account: restored ${to} after catalog load (Pi had fallen back to ${from})`,
+				"info",
+			);
+		}
+		return ok;
+	}
+
 	async function ensureReadyModel(ctx: any, reason: string) {
 		refreshDiscovery(false, ctx);
 		pruneCooldowns();
+		const intended = intendedStartupModel();
+		const onIntended =
+			!!intended &&
+			ctx.model?.provider === intended.provider &&
+			ctx.model?.id === intended.id;
+		// Pi's createAgentSession often parks us on kimi/anthropic because Cursor was not
+		// in the registry yet. That fallback is not the user's choice — restore first,
+		// otherwise startup preflight failovers *away* from the accidental model.
+		if (intended && !onIntended) {
+			await restoreRememberedModel(ctx);
+		}
 		if (isCurrentModelReady(ctx)) return true;
 		// The user chose this account by hand and has not spent the attempt yet. Let the request
 		// through: our reason for believing it unusable is a forecast, and this is the only way
@@ -6714,6 +7128,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			const candidates = findFallbackModels(ctx, ctx.model, {
 				availableNowOnly: true,
 				includeCurrent: true,
+				preferSameIdentity: false,
 			});
 			if (candidates.length === 0) {
 				const wait = nextRecoveryStatus(ctx);
@@ -7107,6 +7522,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// already switched away from it using the old plan's stale 100% snapshot.
 		await refreshRotationUsage(ctx);
 		await syncCodexModelCatalog(ctx);
+		// Pi restores the session model BEFORE extension catalogs finish registering
+		// unless the factory returned the Cursor setup promise. Re-apply anyway: a
+		// cold catalog, a compaction inner session, or a git-reset leftover can still
+		// leave getModel(cursor, grok-4.6) empty.
+		if (cursorReady) await cursorReady.catch(() => undefined);
+		await restoreRememberedModel(ctx);
 		await ensureReadyModel(
 			ctx,
 			"startup preflight: selected account unavailable",
@@ -7118,6 +7539,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// by a new/resumed/forked session) — the extension's background activity must end with it.
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
+		rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
@@ -7142,7 +7564,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// (Pi's default) whenever it cannot positively do better.
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
-		return await runHealthyCompaction(event, ctx);
+		const result = await runHealthyCompaction(event, ctx);
+		if (result !== undefined) return result;
+		// The host runs its own default compaction on the ACTIVE account with no timeout
+		// and maxRetries=0 — one stalled Cursor request is the whole "compaction hangs"
+		// bug. Only intercept when we are genuinely holding a cancellation message;
+		// otherwise leave the host alone (and its queue alone).
+		if (queuedUserInputs.length > 0) {
+			return { cancel: true, reason: "compaction cancelled: failover queue must flush" };
+		}
+		return undefined;
+	});
+
+	// Pi cancelled compaction (or it failed). If we had queued user input for the cooldown,
+	// those messages would sit forever — flush them now so the queue is not the dead end.
+	safeOn("compaction_end", (event: any, ctx: any) => {
+		if (queuedUserInputs.length === 0) return;
+		if (!ctx.isIdle()) return;
+		runBackground("post-compaction queued flush", ctx, () =>
+			attemptQueuedInputResume(ctx),
+		);
 	});
 
 	// Forward-progress signals: any of these means the resumed turn is alive, so reset the
@@ -7293,9 +7734,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const selected = ref(model.provider, model.id);
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
+			rememberUserModel(model);
 			return;
 		}
 		if ((event as any).source === "restore") return;
+		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
 		// failover still applies to that completed request.
@@ -7583,4 +8026,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (!config.enabled || !config.autoContinue || userAbortedChain) return;
 		await maybeDispatchContinuation(ctx);
 	});
+
+	// Pi `await`s the factory. Returning the Cursor setup promise means
+	// createAgentSession's getModel(cursor, cursor-grok-4.6) runs AFTER fallback
+	// models are registered, so the host restore does not print
+	// "Could not restore model" and dump the session onto kimi/anthropic.
+	return cursorReady;
 }
