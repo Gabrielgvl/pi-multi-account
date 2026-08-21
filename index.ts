@@ -375,8 +375,10 @@ function piAiGetModel(provider: string, id: string): any {
 }
 import {
 	CodexCatalogFetchError,
+	OllamaCatalogFetchError,
 	compareCodexModelStrength,
 	fetchCodexModelCatalog,
+	fetchOllamaCloudCatalog,
 	rankAnthropicModelIds,
 	type CodexCatalogModel,
 	type CodexCatalogSnapshot,
@@ -500,8 +502,12 @@ type ProviderFailoverConfig = {
 	preserveInterruptedContext?: boolean;
 	// When the active account is rate-limited/cooling/invalid and Pi needs to compact
 	// (context overflow or threshold), run the summary on a HEALTHY fallback account
-	// instead of letting the default summary die on the dead account. Default: true.
+	// instead of letting the default summary die on the dead account. If every live
+	// attempt fails, CANCEL — never fall through to Pi's unbounded default on the spent
+	// account (that is the infinite "Compacting context…" spinner). Default: true.
 	routeCompactionToHealthyAccount?: boolean;
+	// Upper bound for one routed compaction attempt. 0/absent ⇒ built-in default.
+	compactionWatchdogMs?: number;
 	// When a resumed turn wedges (silent past stuckWatchdogMs with no tool running), auto-cancel
 	// it and auto-resume when an account frees, instead of only notifying. Default: true.
 	autoRecoverStuck?: boolean;
@@ -569,6 +575,7 @@ type RuntimeConfig = Required<
 		| "preferredModels"
 		| "resumeIdleTimeoutMs"
 		| "stuckWatchdogMs"
+		| "compactionWatchdogMs"
 	>
 > & {
 	openaiCodexAliases: OpenAICodexAliasConfig[];
@@ -814,6 +821,7 @@ const DEFAULT_TRANSIENT_COOLDOWN_MS = 60 * 1000;
 const DEFAULT_USAGE_REFRESH_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_STATUS_REFRESH_MS = 60 * 1000;
 const CODEX_MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+const OLLAMA_MODEL_CATALOG_TTL_MS = 30 * 60 * 1000;
 const MIN_ANTHROPIC_USAGE_REFRESH_MS = 10 * 60 * 1000;
 const MAX_MIGRATED_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 // v1.13.7 — Hard ceiling on any LIVE-parsed cooldown. Codex/usage error bodies can report the
@@ -894,7 +902,10 @@ const MAX_SAME_KEY_AUTH_FAILURES = 3;
 const RESUME_IDLE_TIMEOUT_MS = 90 * 1000; // max wait for the prior turn to go idle before we stop blocking
 const STUCK_WATCHDOG_MS = 180 * 1000; // total silence (no stream/tool/response) on a resumed turn ⇒ "stuck"
 const STUCK_REMINDER_MS = 120 * 1000; // re-surface the stuck notice this often while it stays stuck
-const COMPACTION_WATCHDOG_MS = 150 * 1000; // a healthy-account compaction summary may not exceed this
+// Hang bound for a routed summary, not a success SLA. Large sessions on Opus routinely
+// take more than 2–3 minutes; the old 150s cap aborted a live summary and then handed
+// compaction to the spent account, which is how "Compacting context…" never ended.
+const COMPACTION_WATCHDOG_MS = 8 * 60 * 1000;
 
 // --- Circuit breaker (v1.13.0) ---------------------------------------------
 // The reliability FLOOR. If automatic recovery keeps failing (resume wedges, switch
@@ -942,6 +953,12 @@ const DEFAULT_LIMIT_PATTERNS = [
 	"out of credits",
 	"credit balance is too low",
 	"add credits",
+	"third-party apps now draw from your extra usage",
+	// gRPC status code for quota exhaustion. Cursor (and other OpenAI-compatible backends
+	// fronted by gRPC) surface a per-account quota wall as `resource_exhausted`, not a 429.
+	// Without this entry the refusal is unclassified → no failover → every turn dies on the
+	// spent account forever. Treated as a limit so the account cools down and rotation moves on.
+	"resource_exhausted",
 ];
 
 // Errors that mean "this account's authorization is dead" → drop from rotation
@@ -1387,6 +1404,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	preferredModels: {},
 	resumeIdleTimeoutMs: RESUME_IDLE_TIMEOUT_MS,
 	stuckWatchdogMs: STUCK_WATCHDOG_MS,
+	compactionWatchdogMs: COMPACTION_WATCHDOG_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1586,10 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			RESUME_IDLE_TIMEOUT_MS,
 		),
 		stuckWatchdogMs: positiveOr(raw.stuckWatchdogMs, STUCK_WATCHDOG_MS),
+		compactionWatchdogMs: positiveOr(
+			raw.compactionWatchdogMs,
+			COMPACTION_WATCHDOG_MS,
+		),
 	};
 }
 
@@ -2330,17 +2352,14 @@ function registerKimiSlot(
 // Base URLs and model lists for API-key provider families that support multiple
 // accounts (each account = a separate API key in a numbered slot).
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const OLLAMA_LOCAL_BASE_URL = "http://127.0.0.1:11434/v1";
 const OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1";
 
+// Ollama Cloud accepts both the canonical bare id (`kimi-k3`, `glm-5.2`) returned by
+// /v1/models and the legacy `:cloud`-suffixed form, so the suffix is display-only now.
+// Every managed Ollama provider (base + cloned slots) is registered against the Cloud
+// endpoint, so all of its models route there regardless of suffix.
 function isOllamaCloudModel(modelId: string): boolean {
 	return modelId.includes(":cloud");
-}
-
-function ollamaBaseUrlForModel(modelId: string): string {
-	return isOllamaCloudModel(modelId)
-		? OLLAMA_CLOUD_BASE_URL
-		: OLLAMA_LOCAL_BASE_URL;
 }
 const OLLAMA_MODEL_DEFS: Record<string, Record<string, unknown>> = {
 	"glm-5.2:cloud": {
@@ -2363,7 +2382,7 @@ function ollamaModelDef(id: string, providerId: string) {
 		cost: ZERO_COST,
 		reasoning: true,
 	};
-	return { ...def, provider: providerId, baseUrl: ollamaBaseUrlForModel(id) };
+	return { ...def, provider: providerId, baseUrl: OLLAMA_CLOUD_BASE_URL };
 }
 
 // Alibaba Model Studio (Qwen), OpenAI-compatible International endpoint. The old default pointed at
@@ -3224,6 +3243,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (hasManualPin(provider)) manualPinCoveredMessage = true;
 	}
 
+	// Automatic failover onto a same-family sibling whose usage forecast still says spent.
+	// Without a one-attempt pin, the next preflight treats that forecast as a verdict and
+	// bounces to another family (the openai-codex/gpt-5.6-sol → anthropic/claude-opus-5 hop).
+	let failoverPinnedProvider: string | undefined;
+	let failoverPinCoveredMessage = false;
+
+	function pinFailoverProbe(provider: string | undefined) {
+		failoverPinnedProvider = provider;
+		// The hop itself is the attempt. The continuation is not a new user prompt, so the pin
+		// must survive until the next genuine `input`. Marking it covered here means a host that
+		// never emits `before_agent_start` still retires it on the next typed message, instead of
+		// leaving a dead account pinned forever.
+		failoverPinCoveredMessage = true;
+	}
+
+	function retireSpentFailoverPin() {
+		if (failoverPinCoveredMessage) failoverPinnedProvider = undefined;
+	}
+
+	function hasFailoverPin(provider: string | undefined): boolean {
+		return !!provider && failoverPinnedProvider === provider;
+	}
+
+	function markFailoverPinUsed(provider: string | undefined) {
+		if (hasFailoverPin(provider)) failoverPinCoveredMessage = true;
+	}
+
 	// Discovered, authed, deduped provider ids in rotation order.
 	let rotation: string[] = [];
 	let duplicateSlots: Array<{ duplicate: string; primary: string }> = [];
@@ -3246,6 +3292,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// The same, for Anthropic. Anthropic publishes no per-account catalog API, so the host
 	// registry is the only way a new flagship (e.g. claude-opus-5) can win without a release.
 	let registryAnthropicModelOrder: string[] = [];
+	// Live Ollama Cloud catalog (`GET https://ollama.com/v1/models`). Unlike Codex, Ollama
+	// publishes a single account-agnostic catalog per API key, so one fetch covers the base
+	// provider and every cloned `ollama-account-N` slot. Bare ids (e.g. `kimi-k3`) are
+	// registered verbatim — Ollama Cloud accepts them as-is.
+	let discoveredOllamaModelIds: string[] = [];
+	let ollamaCatalogFetchedAt = 0;
 	let lastAuthMtime = -1;
 	const credentialHashes = new Map<string, string>();
 	// Stable per-slot account fingerprints (survive token refresh). A change means the slot was
@@ -3819,6 +3871,84 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (changed) persist();
 	}
 
+	/**
+	 * The full Ollama model id set the base provider and every cloned slot should expose:
+	 * built-in flagship first, then the user's configured `models.json` ids, then the live
+	 * Cloud catalog. Deduped, order-stable. Live ids win visibility without dropping the
+	 * configured ones, so a user-pinned tag is never silently replaced.
+	 */
+	function ollamaRotationModelIds(): string[] {
+		const ids = [...DEFAULT_OLLAMA_MODELS];
+		for (const configured of configuredModelIds(OLLAMA_BASE)) {
+			if (!ids.includes(configured)) ids.push(configured);
+		}
+		for (const discovered of discoveredOllamaModelIds) {
+			if (!ids.includes(discovered)) ids.push(discovered);
+		}
+		return ids;
+	}
+
+	/**
+	 * Pull Ollama Cloud's live catalog and re-register the base provider + every cloned slot
+	 * with the merged set. Idempotent and cheap: a fresh fetch is bounded by OLLAMA_MODEL_CATALOG_TTL_MS
+	 * and the TTL sweep only re-registers when the id set actually changed. Mirrors syncCodexModelCatalog
+	 * but simpler — one API key, one account-agnostic catalog.
+	 */
+	async function syncOllamaModelCatalog(ctx: any, force = false) {
+		if (!config.autoDiscoverModels || !config.includeOllama) return;
+		const entry = readAuthFile()[OLLAMA_BASE];
+		const key =
+			entry && typeof entry.key === "string" && entry.key.length > 0
+				? entry.key
+				: undefined;
+		if (!key) return; // no credential → nothing to discover, configured ids still serve
+		if (
+			!force &&
+				ollamaCatalogFetchedAt &&
+				Date.now() - ollamaCatalogFetchedAt < OLLAMA_MODEL_CATALOG_TTL_MS
+		) {
+			return;
+		}
+		try {
+			const ids = await fetchOllamaCloudCatalog(key);
+			discoveredOllamaModelIds = ids;
+			ollamaCatalogFetchedAt = Date.now();
+			logEvent("ollama_catalog_refresh", {
+				models: ids.length,
+				sample: ids.slice(0, 12).join(","),
+			});
+		} catch (error) {
+			logEvent("ollama_catalog_error", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return; // keep the previous (or empty) discovered set; configured ids still serve
+		}
+		const models = ollamaRotationModelIds().map((m) => ollamaModelDef(m, OLLAMA_BASE));
+		pi.registerProvider(OLLAMA_BASE, {
+			name: "Ollama",
+			baseUrl: OLLAMA_CLOUD_BASE_URL,
+			api: "openai-completions" as any,
+			apiKey: key,
+			models: models as any,
+		} as any);
+		for (const provider of registeredSlots) {
+			if (classifyProvider(provider, config.qwenProvider) !== "ollama") continue;
+			const slotEntry = readAuthFile()[provider];
+			const slotKey =
+				slotEntry && typeof slotEntry.key === "string" && slotEntry.key.length > 0
+					? slotEntry.key
+					: undefined;
+			if (!slotKey) continue;
+			pi.registerProvider(provider, {
+				name: `Ollama (${provider})`,
+				baseUrl: OLLAMA_CLOUD_BASE_URL,
+				api: "openai-completions" as any,
+				apiKey: slotKey,
+				models: ollamaRotationModelIds().map((m) => ollamaModelDef(m, provider)) as any,
+			} as any);
+		}
+	}
+
 	function cachedUsage(provider: string): UsageSnapshot | undefined {
 		const snapshot = usageByProvider.get(provider);
 		if (!snapshot) return undefined;
@@ -4087,6 +4217,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// Re-registering provider models is safe while idle and avoids touching the registry in
 				// the middle of a streaming request. The five-minute catalog TTL keeps this sweep cheap.
 				if (ctx?.isIdle?.() !== false) await syncCodexModelCatalog(ctx);
+				if (ctx?.isIdle?.() !== false) await syncOllamaModelCatalog(ctx);
 			});
 		}, config.usageStatusRefreshMs);
 		(usageStatusTimer as any).unref?.();
@@ -5260,35 +5391,36 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// the rotation order alone could send us straight back to the account we just left, get the
 		// same refusal, and loop between two spent accounts while a live one sat further down.
 		const byRefusalAgeThenRank = (a: Scored, b: Scored) =>
-			// Exhaustion of one account must try a sibling that still has THIS model (and the
-			// session thinking level) before any other family — but only a sibling nothing
-			// predicts as spent. A Codex slot at 100% whose recheck ceiling has elapsed is
-			// selectable so we can prove the forecast stale; it must not beat a free Qwen
-			// account just because it shares a family with the one that just died.
-			(options.preferSameIdentity !== false
-				? Number(b.sameModel && !b.predictedBusy) -
-						Number(a.sameModel && !a.predictedBusy) ||
-					Number(b.sameFamily && !b.predictedBusy) -
-						Number(a.sameFamily && !a.predictedBusy)
-				: 0) ||
-			// An account the provider has CONFIRMED usable outranks one we simply know nothing
-			// about. Both look identical to a cooldown check — neither is benched — but only one
-			// carries evidence, and preferring the guess is how a switch billed as "an account
-			// that can work right now" landed on an out-of-quota account.
-			Number(b.confirmed) - Number(a.confirmed) ||
-			// An account nothing predicts as spent always outranks one we are only re-probing
-			// because its forecast went stale — a maxed usage window is still the best hint we
-			// have about which account to ask FIRST. It just may not veto asking at all.
-			Number(a.predictedBusy) - Number(b.predictedBusy) ||
-			// Among equally-busy (or equally-free) accounts, keep preferring the same model.
+			// Exhaustion of one account must try a sibling of the SAME family (same model first,
+			// otherwise that account's flagship, same thinking level) before any other family.
+			// A 100% usage forecast must not skip those siblings in favour of Claude — the live
+			// hop openai-codex/gpt-5.6-sol → anthropic/claude-opus-5 was that skip. Predicted-busy
+			// only orders siblings relative to each other, after family has already won.
 			(options.preferSameIdentity !== false
 				? Number(b.sameModel) - Number(a.sameModel) ||
 					Number(b.sameFamily) - Number(a.sameFamily)
 				: 0) ||
+			Number(b.confirmed) - Number(a.confirmed) ||
+			Number(a.predictedBusy) - Number(b.predictedBusy) ||
 			a.lastRefusalAt - b.lastRefusalAt ||
 			byRankThenRot(a, b);
 		let availableNow = scored
-			.filter((s) => s.remaining === 0)
+			.filter((s) => {
+				if (s.remaining === 0) return true;
+				// Same-family sibling that has not refused this session: a 100% usage forecast
+				// used to drop it from the candidate list, so failover jumped family (Codex →
+				// Opus) without ever asking the other Codex slots. An actual limit-error
+				// cooldown still excludes it (lastRefusalAt) so we do not ping-pong.
+				// The current account itself is never admitted this way — a different model id
+				// on the same spent slot would otherwise look like a destination (compaction
+				// would retry the cooled account; preflight would keep a dead pin alive).
+				return (
+					options.preferSameIdentity !== false &&
+					s.sameFamily &&
+					s.lastRefusalAt === 0 &&
+					s.model.provider !== currentModel?.provider
+				);
+			})
 			.sort(byRefusalAgeThenRank);
 		if (
 			lastLeftProvider &&
@@ -5403,6 +5535,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			restoreDesiredThinking(ctx);
 			applyOnlyActiveFilter(ctx, fallback.provider);
 			setLastProbe(fallback.provider);
+			if (options.armContinuation !== false) {
+				pinFailoverProbe(fallback.provider);
+			}
 			const record = { from, to, reason, at: Date.now() };
 			currentPromptSwitch =
 				options.armContinuation === false ? undefined : record;
@@ -5649,6 +5784,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			markManualPinUsed(ctx.model?.provider);
 			return true;
 		}
+		if (hasFailoverPin(ctx.model?.provider)) {
+			markFailoverPinUsed(ctx.model?.provider);
+			return true;
+		}
 		const candidates = findFallbackModels(ctx, ctx.model, {
 			availableNowOnly: true,
 			includeCurrent: true,
@@ -5670,28 +5809,50 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// Reject a promise that does not settle within `ms`. Used to bound every network-bound
 	// hand-off (compaction summary) so a wedged provider call can never hang the session.
+	// `onTimeout` MUST abort the underlying work — otherwise the timed-out compact() keeps
+	// running, Pi starts a second one, and the "Compacting context…" spinner never clears.
 	function withTimeout<T>(
 		p: Promise<T>,
 		ms: number,
 		label: string,
+		onTimeout?: () => void,
 	): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
-			const timer = setTimeout(
-				() => reject(new Error(`${label} timed out after ${formatDelay(ms)}`)),
-				ms,
-			);
+			let settled = false;
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				try {
+					onTimeout?.();
+				} catch {
+					/* abort must never mask the timeout */
+				}
+				reject(new Error(`${label} timed out after ${formatDelay(ms)}`));
+			}, ms);
 			timer.unref?.();
 			p.then(
 				(v) => {
+					if (settled) return;
+					settled = true;
 					clearTimeout(timer);
 					resolve(v);
 				},
 				(e) => {
+					if (settled) return;
+					settled = true;
 					clearTimeout(timer);
 					reject(e);
 				},
 			);
 		});
+	}
+
+	function abortQuietly(controller?: AbortController) {
+		try {
+			controller?.abort();
+		} catch {
+			/* already aborted or unimplemented */
+		}
 	}
 
 	// A context-size error (vs. a quota/auth/transient error). Detected against the intrinsic
@@ -5867,104 +6028,198 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	// ----- account-aware compaction ----------------------------------------
-	// Pick the model that should generate the compaction summary. Prefer the current account
-	// when it is genuinely healthy (no switch, cheapest); otherwise the first fallback that is
-	// free RIGHT NOW. Returns undefined when nothing healthier than the (unhealthy) current
-	// account exists — the caller then leaves compaction to Pi's default.
-	function pickCompactionModel(ctx: any): any | undefined {
-		if (isCurrentModelReady(ctx)) return ctx.model;
-		const candidates = findFallbackModels(ctx, ctx.model, {
-			availableNowOnly: true,
-			includeCurrent: false,
-		});
-		return candidates[0];
+	// When the active account is spent, generate the summary on a live account. If every live
+	// attempt fails or times out, CANCEL — returning undefined lets Pi run default compaction
+	// on the spent account with no bound, which is the infinite "Compacting context…" spinner.
+	type CompactFn = (
+		preparation: unknown,
+		model: unknown,
+		apiKey: string | undefined,
+		headers: Record<string, string> | undefined,
+		customInstructions: string | undefined,
+		signal: AbortSignal | undefined,
+		thinkingLevel: unknown,
+	) => Promise<any>;
+
+	async function resolveCompactFn(): Promise<CompactFn | undefined> {
+		if (Object.prototype.hasOwnProperty.call(pi, "__testCompactFn")) {
+			const injected = (pi as any).__testCompactFn;
+			return typeof injected === "function" ? (injected as CompactFn) : undefined;
+		}
+		const mod = (await import("@earendil-works/pi-coding-agent").catch(
+			() => undefined,
+		)) as { compact?: CompactFn } | undefined;
+		return typeof mod?.compact === "function" ? mod.compact : undefined;
 	}
 
-	// session_before_compact handler. STRICTLY fail-safe: any uncertainty returns undefined so
-	// Pi runs its normal default compaction. We only take over when the active account is
-	// unavailable AND a healthy account exists AND the summary succeeds — turning the classic
-	// "compaction hangs because it ran on the just-rate-limited account" into a clean summary
-	// generated on a live account.
+	function compactionCancelled(reason: string): {
+		cancel: true;
+		reason: string;
+	} {
+		compactionRoutedNote = reason;
+		return { cancel: true, reason };
+	}
+
+	function compactionCandidates(ctx: any): any[] {
+		return findFallbackModels(ctx, ctx.model, {
+			availableNowOnly: true,
+			includeCurrent: false,
+		}).filter(
+			(model: any) =>
+				model &&
+				!(
+					model.provider === ctx.model?.provider &&
+					model.id === ctx.model?.id
+				),
+		);
+	}
+
 	async function runHealthyCompaction(
 		event: any,
 		ctx: any,
-	): Promise<{ compaction: any } | undefined> {
+	): Promise<
+		{ compaction: any } | { cancel: true; reason: string } | undefined
+	> {
 		try {
 			if (!config.enabled || !config.routeCompactionToHealthyAccount)
 				return undefined;
 			const preparation = event?.preparation;
 			if (!preparation) return undefined;
-			// Current account is healthy → Pi's default (on the current account) is fine.
-			if (isCurrentModelReady(ctx)) {
-				compactionRoutedNote = undefined;
-				return undefined;
+			if (event?.signal?.aborted) {
+				return compactionCancelled("compaction aborted");
 			}
-			const model = pickCompactionModel(ctx);
-			if (
-				!model ||
-				(model.provider === ctx.model?.provider && model.id === ctx.model?.id)
-			) {
-				// No account is free right now. Don't make it worse — let Pi try its default; the
-				// pending-resume machinery pauses the session until an account recovers.
-				compactionRoutedNote = "no live account for compaction; used default";
-				return undefined;
+			const currentReady = isCurrentModelReady(ctx);
+			const compactFn = await resolveCompactFn();
+			const candidates = [
+				...(currentReady && ctx.model ? [ctx.model] : []),
+				...compactionCandidates(ctx),
+			];
+			if (candidates.length === 0) {
+				ctx.ui?.notify?.(
+					"Provider failover: no live account can summarize; cancelled instead of hanging on the spent account.",
+					"warning",
+				);
+				return compactionCancelled(
+					"no live account for compaction; cancelled",
+				);
 			}
-			const auth = await ctx.modelRegistry?.getApiKeyAndHeaders?.(model);
-			if (!auth?.ok || (!auth.apiKey && !auth.headers)) {
-				compactionRoutedNote = `compaction auth unavailable for ${model.provider}`;
-				return undefined;
-			}
-			const mod = (await import("@earendil-works/pi-coding-agent").catch(
-				() => undefined,
-			)) as { compact?: (...args: any[]) => Promise<any> } | undefined;
-			const compactFn = mod?.compact;
-			if (typeof compactFn !== "function") return undefined; // older host: cannot route
 			let thinkingLevel: any;
 			try {
 				thinkingLevel = (pi as any).getThinkingLevel?.();
 			} catch {
 				/* optional */
 			}
-			ctx.ui?.notify?.(
-				`Provider failover: ${ctx.model?.provider ?? "active"} account is unavailable for compaction; summarizing on ${model.provider} instead.`,
-				"info",
-			);
-			const result = await withTimeout(
-				compactFn(
-					preparation,
-					model,
-					auth.apiKey,
-					auth.headers,
-					event?.customInstructions,
-					event?.signal,
-					thinkingLevel,
-				),
-				COMPACTION_WATCHDOG_MS,
-				`compaction on ${model.provider}`,
-			);
-			if (
-				!result ||
-				typeof result.summary !== "string" ||
-				!result.summary.trim()
-			) {
-				compactionRoutedNote = "healthy compaction empty; used default";
-				return undefined;
+			const timeoutMs = config.compactionWatchdogMs;
+			const tried: string[] = [];
+			for (const model of candidates) {
+				if (event?.signal?.aborted) {
+					return compactionCancelled("compaction aborted");
+				}
+				const auth = await ctx.modelRegistry?.getApiKeyAndHeaders?.(model);
+				if (!auth?.ok || (!auth.apiKey && !auth.headers)) {
+					tried.push(`${model.provider} (no auth)`);
+					continue;
+				}
+				const isCurrent =
+					model.provider === ctx.model?.provider &&
+					model.id === ctx.model?.id;
+				if (!isCurrent) {
+					ctx.ui?.notify?.(
+						`Provider failover: ${ctx.model?.provider ?? "active"} account is unavailable for compaction; summarizing on ${model.provider} instead.`,
+						"info",
+					);
+				}
+				if (typeof compactFn !== "function") {
+					tried.push(`${model.provider} (host cannot compact)`);
+					continue;
+				}
+				const attempt = new AbortController();
+				const onParentAbort = () => abortQuietly(attempt);
+				if (typeof event?.signal?.addEventListener === "function") {
+					event.signal.addEventListener("abort", onParentAbort, {
+						once: true,
+					});
+				}
+				try {
+					const result = await withTimeout(
+						compactFn(
+							preparation,
+							model,
+							auth.apiKey,
+							auth.headers,
+							event?.customInstructions,
+							attempt.signal,
+							thinkingLevel,
+						),
+						timeoutMs,
+						`compaction on ${model.provider}`,
+						() => abortQuietly(attempt),
+					);
+					if (
+						result &&
+						typeof result.summary === "string" &&
+						result.summary.trim()
+					) {
+						compactionRoutedNote = `compacted on ${model.provider}`;
+						logEvent("compaction_routed", {
+							to: model.provider,
+							reason: event?.reason,
+							from: ctx.model?.provider,
+						});
+						return { compaction: result };
+					}
+					tried.push(`${model.provider} (empty)`);
+				} catch (error) {
+					abortQuietly(attempt);
+					if (event?.signal?.aborted) {
+						return compactionCancelled("compaction aborted");
+					}
+					tried.push(`${model.provider} (${String(error).slice(0, 80)})`);
+					logEvent("compaction_failed", {
+						error: String(error),
+						provider: model.provider,
+					});
+				} finally {
+					if (typeof event?.signal?.removeEventListener === "function") {
+						event.signal.removeEventListener("abort", onParentAbort);
+					}
+				}
 			}
-			compactionRoutedNote = `compacted on ${model.provider}`;
-			logEvent("compaction_routed", {
-				to: model.provider,
-				reason: event?.reason,
-				from: ctx.model?.provider,
-			});
-			return { compaction: result };
-		} catch (error) {
-			compactionRoutedNote = `healthy compaction failed: ${String(error).slice(0, 60)}`;
-			logEvent("compaction_failed", { error: String(error) });
-			ctx?.ui?.notify?.(
-				`Provider failover: healthy-account compaction did not finish (${String(error).slice(0, 100)}); using Pi's default compaction.`,
+			if (typeof compactFn !== "function") {
+				// Could not wrap. A healthy current account can still use Pi's default;
+				// a spent one must not — that default is the infinite spinner.
+				if (currentReady) {
+					compactionRoutedNote = undefined;
+					return undefined;
+				}
+				ctx.ui?.notify?.(
+					"Provider failover: the spent account cannot compact and this Pi build cannot reroute the summary; cancelled instead of hanging.",
+					"warning",
+				);
+				return compactionCancelled(
+					"cannot route compaction on this host",
+				);
+			}
+			const detail = tried.join("; ") || "no candidates";
+			ctx.ui?.notify?.(
+				`Provider failover: could not finish compaction on any live account (${detail.slice(0, 140)}); cancelled instead of hanging on the spent one.`,
 				"warning",
 			);
-			return undefined;
+			return compactionCancelled(
+				"healthy-account compaction failed; cancelled",
+			);
+		} catch (error) {
+			logEvent("compaction_failed", { error: String(error) });
+			if (event?.signal?.aborted) {
+				return compactionCancelled("compaction aborted");
+			}
+			ctx?.ui?.notify?.(
+				`Provider failover: compaction routing failed (${String(error).slice(0, 100)}); cancelled instead of hanging.`,
+				"warning",
+			);
+			return compactionCancelled(
+				`healthy compaction failed: ${String(error).slice(0, 60)}`,
+			);
 		}
 	}
 
@@ -6713,13 +6968,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			configuredFallbacks = config.fallbacks.slice();
 			if (config.autoDiscoverModels !== previousAutoDiscoverModels) {
 				registryCodexModelOrder = [];
-				if (!config.autoDiscoverModels) discoveredCodexModelOrder = [];
+				if (!config.autoDiscoverModels) {
+					discoveredCodexModelOrder = [];
+					discoveredOllamaModelIds = [];
+					ollamaCatalogFetchedAt = 0;
+				}
 			}
 			refreshDiscovery(true, ctx);
 			startUsageStatusTimer(ctx);
 			runBackground("reload account metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
+				await syncOllamaModelCatalog(ctx, true);
 			});
 			ctx.ui.notify(
 				"pi-multi-account: config reloaded and accounts re-discovered",
@@ -6732,6 +6992,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			runBackground("rediscover account metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
+				await syncOllamaModelCatalog(ctx, true);
 			});
 			ctx.ui.notify(
 				`pi-multi-account: rediscovered accounts${changed ? "" : " (no auth.json change)"}. Rotation: ${rotation.join(" → ") || "none"}`,
@@ -7360,6 +7621,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// nothing is downgraded — but everything the user configured is carried too, instead of
 		// being replaced by this list.
 		const ids = [...preferred];
+		if (family === "ollama") {
+			for (const discovered of discoveredOllamaModelIds) {
+				if (!ids.includes(discovered)) ids.push(discovered);
+			}
+		}
 		for (const configured of configuredModelIds(baseId)) {
 			if (!ids.includes(configured)) ids.push(configured);
 		}
@@ -7522,6 +7788,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// already switched away from it using the old plan's stale 100% snapshot.
 		await refreshRotationUsage(ctx);
 		await syncCodexModelCatalog(ctx);
+		await syncOllamaModelCatalog(ctx);
 		// Pi restores the session model BEFORE extension catalogs finish registering
 		// unless the factory returned the Cursor setup promise. Re-apply anyway: a
 		// cold catalog, a compaction inner session, or a git-reset leftover can still
@@ -7552,6 +7819,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		expectingInjectedContinuation = false;
 		userAbortedChain = false;
 		autoContinuesThisPrompt = 0;
+		manualPinnedProvider = undefined;
+		failoverPinnedProvider = undefined;
 		responseCooldownHints.clear();
 		handledAssistantErrors.clear();
 		ctx?.ui?.setStatus?.("multi-account-quota", undefined);
@@ -7559,19 +7828,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// Make compaction survive account exhaustion. When the active account is rate-limited /
 	// invalidated and Pi needs to summarize (context overflow or threshold), Pi's default would
-	// run the summary on that dead account and hang ("Working…" forever at high context). We
-	// generate the summary on a healthy account instead. Strictly fail-safe: returns undefined
-	// (Pi's default) whenever it cannot positively do better.
+	// run the summary on that dead account and hang ("Compacting context…" forever). We generate
+	// the summary on a healthy account instead. If that cannot finish, we CANCEL — never return
+	// undefined onto a spent account, because Pi's default has no timeout of its own.
 	safeOn("session_before_compact", async (event: any, ctx: any) => {
 		if (event?.reason === "overflow") lastContextOverflowAt = Date.now();
 		const result = await runHealthyCompaction(event, ctx);
 		if (result !== undefined) return result;
-		// The host runs its own default compaction on the ACTIVE account with no timeout
-		// and maxRetries=0 — one stalled Cursor request is the whole "compaction hangs"
-		// bug. Only intercept when we are genuinely holding a cancellation message;
+		// The host runs its own default compaction on the ACTIVE account with no timeout.
+		// Only intercept when we are genuinely holding a cancellation message;
 		// otherwise leave the host alone (and its queue alone).
 		if (queuedUserInputs.length > 0) {
 			return { cancel: true, reason: "compaction cancelled: failover queue must flush" };
+		}
+		// runHealthyCompaction returns undefined only when routing is off or the current
+		// account is healthy. If the current account is still spent, do not let Pi default
+		// compact on it — that is the hang.
+		if (
+			config.routeCompactionToHealthyAccount &&
+			!isCurrentModelReady(ctx)
+		) {
+			return {
+				cancel: true,
+				reason: "active account unavailable for compaction",
+			};
 		}
 		return undefined;
 	});
@@ -7631,6 +7911,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// A manual choice is owed ONE message. This is the next one, so a reprieve that already
 		// carried a message retires here — before the readiness check consults it.
 		retireSpentManualPin();
+		retireSpentFailoverPin();
 
 		if (
 			await ensureReadyModel(ctx, "preflight: selected account unavailable")

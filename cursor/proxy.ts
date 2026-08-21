@@ -13,6 +13,7 @@ import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
+import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -169,6 +170,7 @@ interface StreamState {
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
+  promptTokenEstimate: number;
 }
 
 interface ToolResultInfo {
@@ -710,11 +712,13 @@ async function handleChatCompletion(
     hasActiveBridge: !!activeBridge,
   });
 
+  const promptTokens = estimatePromptTokens(body.messages, body.tools);
+
   if (activeBridge && toolResults.length > 0) {
     debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId, promptTokens);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -771,10 +775,10 @@ async function handleChatCompletion(
 
   if (body.stream === false) {
     debugLog("chat.dispatch_nonstream", { requestId, convKey });
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId);
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId, promptTokens);
   } else {
     debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId, promptTokens);
   }
 }
 
@@ -1519,10 +1523,7 @@ function makeHeartbeatBytes(): Uint8Array {
 }
 
 function computeUsage(state: StreamState) {
-  const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
-  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
-  return { prompt_tokens, completion_tokens, total_tokens };
+  return resolveCursorUsage(state);
 }
 
 function respondWithPendingToolCalls(
@@ -1530,9 +1531,15 @@ function respondWithPendingToolCalls(
   pendingExecs: PendingExec[],
   stream: boolean,
   res: ServerResponse,
+  promptTokenEstimate = 0,
 ): void {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  const usage = resolveCursorUsage({
+    outputTokens: 0,
+    totalTokens: 0,
+    promptTokenEstimate,
+  });
   const toolCalls = pendingExecs.map((exec, index) => ({
     index,
     id: exec.toolCallId,
@@ -1562,6 +1569,14 @@ function respondWithPendingToolCalls(
       model: modelId,
       choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
     })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+      choices: [],
+      usage,
+    })}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
     return;
@@ -1578,7 +1593,7 @@ function respondWithPendingToolCalls(
       message: { role: "assistant", content: null, tool_calls: toolCalls },
       finish_reason: "tool_calls",
     }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage,
   }));
 }
 
@@ -1603,6 +1618,7 @@ function handleStreamingResponse(
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
+  promptTokenEstimate = 0,
 ): void {
   debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
@@ -1619,6 +1635,7 @@ function handleStreamingResponse(
     req,
     res,
     requestId,
+    promptTokenEstimate,
   );
 }
 
@@ -1662,6 +1679,7 @@ function writeSSEStream(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  promptTokenEstimate = 0,
 ): void {
   debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1702,7 +1720,7 @@ function writeSSEStream(
     };
   };
 
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, promptTokenEstimate };
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
@@ -1771,6 +1789,7 @@ function writeSSEStream(
             debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
 
             sendSSE(makeChunk({}, "tool_calls"));
+            sendSSE(makeUsageChunk());
             sendDone();
             closeResponse();
           },
@@ -1854,6 +1873,7 @@ export function writeSSEStreamForTests(args: {
   req: IncomingMessage;
   res: ServerResponse;
   requestId?: string;
+  promptTokenEstimate?: number;
 }): void {
   writeSSEStream(
     args.bridge,
@@ -1868,6 +1888,7 @@ export function writeSSEStreamForTests(args: {
     args.req,
     args.res,
     args.requestId,
+    args.promptTokenEstimate ?? 0,
   );
 }
 
@@ -1884,6 +1905,7 @@ function handleToolResultResume(
   res: ServerResponse,
   stream: boolean,
   requestId?: string,
+  promptTokenEstimate = 0,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
   debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
@@ -1907,7 +1929,7 @@ function handleToolResultResume(
       currentTurn,
     });
     debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
-    respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res);
+    respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res, promptTokenEstimate);
     return;
   }
 
@@ -1956,6 +1978,7 @@ function handleToolResultResume(
     req,
     res,
     requestId,
+    promptTokenEstimate,
   );
 }
 
@@ -1971,6 +1994,7 @@ async function handleNonStreamingResponse(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  promptTokenEstimate = 0,
 ): Promise<void> {
   debugLog("nonstream.start", { requestId, convKey, modelId, currentTurn, completedTurnCount: completedTurns.length });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1991,7 +2015,7 @@ async function handleNonStreamingResponse(
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, promptTokenEstimate };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;

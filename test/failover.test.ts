@@ -139,6 +139,7 @@ function setup(opts: {
 		apiKey?: string;
 		headers?: Record<string, string>;
 	};
+	compactFn?: (...args: any[]) => Promise<any>;
 	contextUsage?: {
 		tokens: number | null;
 		contextWindow: number;
@@ -362,6 +363,8 @@ function setup(opts: {
 	// Simulate a host with no prompt-injection fallback either — the worst case, where the extension
 	// can still switch accounts but cannot auto-continue at all.
 	if (opts.omitSendUserMessage) delete pi.sendUserMessage;
+	// Tests always take this hook so they never import the real compact() (network).
+	(pi as any).__testCompactFn = opts.compactFn;
 
 	piMultiAccount(pi);
 
@@ -659,6 +662,36 @@ test("cross-family failover picks the target provider's default model, not the s
 	});
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
 	assert.deepEqual(t.rec.setModels, ["openai-codex/gpt-5.5"]);
+});
+
+test("Anthropic third-party extra-usage 400 is a limit, not a request bug", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await finishError(
+		t,
+		"anthropic",
+		"claude-opus-4-8",
+		'400 {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits"}}',
+	);
+	assert.deepEqual(t.rec.setModels, ["openai-codex-account-2/gpt-5.5"]);
+});
+
+test("Cursor resource_exhausted (gRPC quota) is a limit, so failover moves off the spent account", async () => {
+	const t = setup({
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+	});
+	await finishError(
+		t,
+		"cursor",
+		"cursor-grok-4.6",
+		"Connect error resource_exhausted: Error",
+	);
+	// Must have switched away from the spent Cursor account — not died in place.
+	assert.ok(
+		t.rec.setModels.length > 0 && t.rec.setModels[0] !== "cursor/cursor-grok-4.6",
+		`resource_exhausted must trigger failover, got ${JSON.stringify(t.rec.setModels)}`,
+	);
 });
 
 test("failover resumes with existing context instead of injecting a user message", async () => {
@@ -3309,17 +3342,29 @@ test("a genuinely maxed monthly Codex account is benched for its REAL reset, so 
 		"gpt-5.5",
 		"usage limit has been reached",
 	);
-	assert.ok(
-		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
-		`should fail over to the healthy Qwen/Alibaba account, got ${JSON.stringify(t.rec.setModels)}`,
+	assert.equal(
+		t.rec.setModels[0],
+		"openai-codex-account-3/gpt-5.5",
+		`first hop must try the other Codex slot, not skip it for Qwen; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	await finishError(
+		t,
+		"openai-codex-account-3",
+		"gpt-5.5",
+		"usage limit has been reached",
 	);
 	assert.ok(
-		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
-		"must NOT ping-pong onto the equally-spent Codex account-3",
+		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		`after the sibling also refused, failover must reach the healthy Qwen/Alibaba account; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.equal(
+		t.rec.setModels.filter((m) => m.startsWith("openai-codex-account-2/")).length,
+		0,
+		"must not ping-pong back onto the Codex slot that already refused",
 	);
 });
 
-test("a spent account known ONLY from a STALE usage snapshot (100%, no recorded cooldown, never threw an error) is still benched — failover does not land on it", async () => {
+test("a spent account known ONLY from a STALE usage snapshot is still tried when it is a same-family sibling", async () => {
 	const now = Date.now();
 	const accounts: Account = {
 		"openai-codex-account-2": {
@@ -3370,12 +3415,57 @@ test("a spent account known ONLY from a STALE usage snapshot (100%, no recorded 
 		"usage limit has been reached",
 	);
 	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
+		`same-family sibling is tried even on a stale 100% forecast; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+	assert.ok(
+		!t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		"must not jump family while a Codex sibling has not refused",
+	);
+});
+
+test("a 100% usage forecast still benches a dead account when failing over FROM another family", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c3",
+				refresh: "r3",
+				accountId: "codex-3",
+			},
+			alibaba: { type: "api_key", key: "qwen-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-3": {
+					provider: "openai-codex-account-3",
+					family: "codex",
+					fetchedAt: now - 60 * 60 * 1000,
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 14 * 24 * 60 * 60 * 1000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(
 		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
 		`must fail over to the live Qwen account, got ${JSON.stringify(t.rec.setModels)}`,
 	);
 	assert.ok(
 		!t.rec.setModels.some((m) => m.startsWith("openai-codex-account-3/")),
-		"must NOT land on account-3 whose stale usage already proves it is spent",
+		"must NOT land on a spent Codex account when leaving a different family",
 	);
 });
 
@@ -3445,11 +3535,79 @@ test("session_before_compact: leaves Pi's default compaction alone when the acti
 		signal: { aborted: false },
 	});
 	assert.equal(result, undefined, "healthy account → Pi's default compaction");
-	assert.equal(
-		t.rec.compactionAuthFor.length,
-		0,
-		"no reroute auth resolved when not needed",
+	assert.ok(
+		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
+		"the current healthy account is the one considered for the summary",
 	);
+});
+
+test("session_before_compact: a healthy current account is compacted with a time bound, not Pi's untimed default", async () => {
+	const tried: string[] = [];
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		compactFn: async (_p, model) => {
+			tried.push(model.provider);
+			return COMPACTION_SUMMARY;
+		},
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 1000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
+	assert.deepEqual(tried, ["anthropic"], "compacts on the current account; no reroute");
+	assert.ok(
+		!t.rec.notifies.some((n) => /summarizing on/i.test(n)),
+		"no 'summarizing on X instead' toast when the current account itself is live",
+	);
+});
+
+test("session_before_compact: a timed-out compact on the current healthy account is aborted and the next live account is tried", async () => {
+	const tried: string[] = [];
+	let abortedCurrent = false;
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { compactionWatchdogMs: 40 },
+		compactFn: (preparation, model, apiKey, headers, instructions, signal) => {
+			tried.push(model.provider);
+			if (model.provider === "anthropic") {
+				return hangingCompact(() => {
+					abortedCurrent = true;
+				})(
+					preparation,
+					model,
+					apiKey,
+					headers,
+					instructions,
+					signal,
+				);
+			}
+			return Promise.resolve(COMPACTION_SUMMARY);
+		},
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "manual",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(abortedCurrent, true, "the wedged current compact is aborted");
+	assert.ok(tried.includes("anthropic"));
+	assert.ok(
+		tried.includes("openai-codex-account-2"),
+		`next live account is tried after the current one times out; got: ${tried.join(", ")}`,
+	);
+	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
 });
 
 test("session_before_compact: routes the summary to a healthy account when the active account is cooling", async () => {
@@ -3480,10 +3638,14 @@ test("session_before_compact: routes the summary to a healthy account when the a
 		),
 		"the cooling account is never chosen to summarize",
 	);
-	assert.equal(result, undefined, "auth unavailable in test → safe fallback");
+	assert.equal(
+		result?.cancel,
+		true,
+		"auth unavailable → cancel, never Pi default on the spent account",
+	);
 });
 
-test("session_before_compact: falls back to Pi default (never throws/hangs) when no account is available", async () => {
+test("session_before_compact: cancels instead of hanging on Pi default when no account is available", async () => {
 	const t = setup({
 		accounts: ONE_ACCOUNT,
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
@@ -3498,12 +3660,191 @@ test("session_before_compact: falls back to Pi default (never throws/hangs) when
 		},
 		signal: { aborted: false },
 	});
-	assert.equal(result, undefined, "no live account → safe fallback");
+	assert.equal(
+		result?.cancel,
+		true,
+		"no live account → cancel (Pi default on the spent account is the hang)",
+	);
 	assert.equal(
 		t.rec.compactionAuthFor.length,
 		0,
 		"no reroute attempted when nothing is healthy",
 	);
+});
+
+const COMPACTION_SUMMARY = {
+	summary: "the conversation so far",
+	firstKeptEntryId: "e1",
+	tokensBefore: 250000,
+};
+
+function hangingCompact(onAbort: () => void) {
+	return (
+		_preparation: unknown,
+		_model: unknown,
+		_apiKey: unknown,
+		_headers: unknown,
+		_instructions: unknown,
+		signal?: AbortSignal,
+	) =>
+		new Promise((_, reject) => {
+			const fail = () => {
+				onAbort();
+				const err = new Error("aborted");
+				err.name = "AbortError";
+				reject(err);
+			};
+			if (signal?.aborted) {
+				fail();
+				return;
+			}
+			signal?.addEventListener?.("abort", fail, { once: true });
+		});
+}
+
+test("session_before_compact: returns the summary from a live account", async () => {
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		compactFn: async () => COMPACTION_SUMMARY,
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "manual",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
+	assert.ok(
+		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
+		"summary is generated on the live anthropic account",
+	);
+});
+
+test("session_before_compact: a timed-out live summary is aborted and cancelled — never handed to the spent account", async () => {
+	let aborted = false;
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { compactionWatchdogMs: 40 },
+		compactFn: hangingCompact(() => {
+			aborted = true;
+		}),
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "manual",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.equal(
+		result?.cancel,
+		true,
+		"timeout cancels instead of falling through to the spent Codex account",
+	);
+	assert.equal(
+		result?.compaction,
+		undefined,
+		"no fake summary is returned after a timeout",
+	);
+	assert.equal(aborted, true, "the timed-out compact() call is aborted, not leaked");
+	assert.ok(
+		t.rec.notifies.some((n) => /cancelled instead of hanging/i.test(n)),
+		"the user is told the spinner will stop, not that Pi default will take over",
+	);
+});
+
+test("session_before_compact: Escape cancels immediately instead of starting Pi default on the spent account", async () => {
+	const signal = new AbortController();
+	signal.abort();
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		compactFn: async () => {
+			throw new Error("compact must not run after abort");
+		},
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "manual",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: signal.signal,
+	});
+	assert.equal(result?.cancel, true);
+	assert.equal(
+		t.rec.compactionAuthFor.length,
+		0,
+		"an already-aborted compact never resolves auth or starts a summary",
+	);
+});
+
+test("session_before_compact: a timeout on the first live account tries the next one", async () => {
+	const tried: string[] = [];
+	let abortedFirst = false;
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"anthropic-account-2": {
+				type: "oauth",
+				access: "a-tok-2",
+				refresh: "a-ref-2",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { compactionWatchdogMs: 40 },
+		compactFn: (preparation, model, apiKey, headers, instructions, signal) => {
+			tried.push(model.provider);
+			if (model.provider === "anthropic") {
+				return hangingCompact(() => {
+					abortedFirst = true;
+				})(
+					preparation,
+					model,
+					apiKey,
+					headers,
+					instructions,
+					signal,
+				);
+			}
+			return Promise.resolve(COMPACTION_SUMMARY);
+		},
+	});
+	const result = await t.fire("session_before_compact", {
+		reason: "overflow",
+		preparation: {
+			messagesToSummarize: [],
+			firstKeptEntryId: "e1",
+			tokensBefore: 250000,
+		},
+		signal: { aborted: false },
+	});
+	assert.ok(tried.includes("anthropic"), "the first live account is tried");
+	assert.equal(abortedFirst, true, "the timed-out first attempt is aborted");
+	assert.ok(
+		tried.includes("anthropic-account-2"),
+		`the next live account is tried after the timeout; got: ${tried.join(", ")}`,
+	);
+	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
 });
 
 test("the wait-for-idle before a resume is bounded — never an infinite busy-loop", async () => {
@@ -3898,16 +4239,24 @@ test("exhausted account fails over to a sibling with the same model before any o
 	);
 });
 
-test("a cooling same-model sibling yields to another family", async () => {
+test("a sibling that already refused yields to another family", async () => {
 	const t = setup({
 		accounts: {
 			"kimi-coding": { type: "oauth", access: "k1", refresh: "kr1" },
 			"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "kr2" },
 			anthropic: { type: "oauth", access: "a", refresh: "ar" },
 		},
-		current: { provider: "kimi-coding-account-2", id: "k3" },
-		seedCooldownsMsFromNow: { "kimi-coding": 3_600_000 },
+		current: { provider: "kimi-coding", id: "k3" },
+		config: { providerOrder: ["anthropic", "kimi-coding"] },
 	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(t, "kimi-coding", "k3", "429 rate_limit_error");
+	assert.equal(
+		t.rec.setModels[0],
+		"kimi-coding-account-2/k3",
+		`first hop stays in family; got ${t.rec.setModels.join(", ")}`,
+	);
 	await finishError(
 		t,
 		"kimi-coding-account-2",
@@ -3916,11 +4265,90 @@ test("a cooling same-model sibling yields to another family", async () => {
 	);
 	assert.ok(
 		t.rec.setModels.some((m) => m.startsWith("anthropic/")),
-		`with the only k3 sibling cooling, another family must take over; got ${t.rec.setModels.join(", ")}`,
+		`after the sibling also refused, another family must take over; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(
+		t.rec.setModels.filter((m) => m.startsWith("kimi-coding/")).length,
+		0,
+		`must not ping-pong back to the sibling that just refused; got ${t.rec.setModels.join(", ")}`,
+	);
+});
+
+test("a 100% usage forecast on a Codex sibling does not skip it for Claude", async () => {
+	// Live 2026-08-20: openai-codex/gpt-5.6-sol plus-limit → anthropic/claude-opus-5 because every
+	// Codex slot's usage snapshot said 100% / blocked, so siblings were dropped from availableNow.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			"openai-codex": {
+				type: "oauth",
+				access: "c1",
+				refresh: "cr1",
+				accountId: "plus-1",
+			},
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c2",
+				refresh: "cr2",
+				accountId: "free-2",
+			},
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { providerOrder: ["anthropic", "openai-codex"] },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {
+				"openai-codex-account-2": now + 10 * 60 * 1000,
+			},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					serviceable: false,
+					plan: "free",
+					primary: {
+						usedPercent: 100,
+						resetAt: now + 60 * 60 * 1000,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"openai-codex",
+		"gpt-5.5",
+		"You have hit your ChatGPT usage limit (plus plan). Try again in ~1596 min.",
+	);
+	assert.equal(
+		t.rec.setModels[0],
+		"openai-codex-account-2/gpt-5.5",
+		`must try the other Codex slot at the same thinking level, not Claude; got ${t.rec.setModels.join(", ")}`,
 	);
 	assert.ok(
-		!t.rec.setModels.some((m) => m.startsWith("kimi-coding/")),
-		`must not land on the cooling sibling; got ${t.rec.setModels.join(", ")}`,
+		!t.rec.setModels.some((m) => m.startsWith("anthropic")),
+		`must not jump to Claude while a Codex sibling has not refused; got ${t.rec.setModels.join(", ")}`,
+	);
+	assert.equal(
+		t.thinkingLevel(),
+		"high",
+		"the session thinking level must survive the Codex sibling switch",
+	);
+	const afterHop = t.rec.setModels.length;
+	await t.fire("before_agent_start", {});
+	assert.equal(
+		t.rec.setModels.length,
+		afterHop,
+		`the sibling hop must survive last-moment preflight; it bounced to ${t.rec.setModels.slice(afterHop).join(", ")}`,
 	);
 });
 
