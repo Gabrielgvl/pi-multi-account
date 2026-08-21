@@ -5725,6 +5725,72 @@ test("registering the Ollama base provider must not narrow the user's own model 
 	}
 });
 
+test("a catalog sync refreshes the only-active hidden copy, so an immediate switch shows fresh models", async () => {
+	// Real-world miss (2026-08-21): Ollama was hidden by only-active holding the pre-sync list;
+	// the catalog sync then replaced the live registration with kimi-k3 et al, but a manual
+	// switch BEFORE the next message_start re-hidden the provider from the STALE stored copy —
+	// /model showed the old six. The sync now re-applies the filter in the same tick.
+	writeFileSync(
+		join(AGENT_DIR, "models.json"),
+		JSON.stringify({
+			providers: {
+				ollama: {
+					api: "openai-completions",
+					models: [{ id: "glm-5.2:cloud" }],
+				},
+			},
+		}),
+		{ mode: 0o600 },
+	);
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: any) => {
+		const url = String(input);
+		if (url.startsWith("https://ollama.com/v1/models")) {
+			return new Response(
+				JSON.stringify({
+					object: "list",
+					data: [{ id: "kimi-k3" }, { id: "glm-5.2" }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}
+		return new Response(JSON.stringify({}), {
+			status: 404,
+			headers: { "content-type": "application/json" },
+		});
+	}) as typeof fetch;
+	try {
+		const t = setup({
+			accounts: {
+				anthropic: { type: "oauth", access: "a", refresh: "r" },
+				ollama: { type: "api_key", key: "ollama-base-key" },
+			},
+			current: { provider: "anthropic", id: "claude-opus-4-8" },
+			config: { includeOllama: true, autoDiscoverModels: true, onlyActive: true },
+		});
+		await t.fire("session_start");
+		// ollama must be hidden now (inactive), then the user switches immediately — no message_start
+		// in between. The restored list must already contain the synced kimi-k3.
+		await t.command("switch ollama");
+		const ids = t.ctx.modelRegistry
+			.getAll()
+			.filter((model: any) => model.provider === "ollama")
+			.map((model: any) => model.id);
+		assert.ok(
+			ids.includes("kimi-k3"),
+			`the synced catalog must survive the hide→switch round-trip; got ${JSON.stringify(ids)}`,
+		);
+		assert.ok(
+			ids.includes("glm-5.2:cloud"),
+			`configured ids must survive too; got ${JSON.stringify(ids)}`,
+		);
+		await t.fire("session_shutdown");
+	} finally {
+		globalThis.fetch = originalFetch;
+		rmSync(join(AGENT_DIR, "models.json"), { force: true });
+	}
+});
+
 test("a provider Pi has no models for is marked unconfigured instead of looking healthy", async () => {
 	// Joining the rotation is not the same as being usable. An account whose models Pi does not
 	// know contributes no candidate at selection time, so it can never be chosen — but it was

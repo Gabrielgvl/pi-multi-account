@@ -1,7 +1,7 @@
 # What "working" means — and what locks it
 
 This file is the contract. Each row is a promise the extension makes, written in plain language,
-next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (235 tests)
+next to the automated test that will FAIL the moment that promise breaks. `pnpm test` (244 tests)
 runs them all; CI blocks any change that violates a promise. If you hit a behaviour that feels
 broken and it is **not** on this list, that is a missing guarantee — it should become a new row +
 test, not a one-off patch.
@@ -49,6 +49,7 @@ test, not a one-off patch.
 | 31 | **Anthropic's third-party extra-usage 400 fails over as a limit**, not as a malformed request. | `Anthropic third-party extra-usage 400 is a limit, not a request bug` |
 | 32 | **Ollama Cloud's live catalog is discovered, so new Cloud models appear in `/model` without editing `models.json`.** `https://ollama.com/v1/models` is fetched at startup and on idle sweeps; canonical bare ids (`kimi-k3`, `glm-5.2`) are merged with the built-in and configured lists for the base provider and every cloned slot. A failed fetch leaves the previous list intact. | `fetchOllamaCloudCatalog parses the /v1/models data array into canonical ids` · `fetchOllamaCloudCatalog throws on HTTP error` · `fetchOllamaCloudCatalog throws on empty catalog` |
 | 33 | **Cursor `resource_exhausted` (gRPC quota) fails over as a limit**, so a dead Cursor account stops killing every turn with `Provider finish_reason: error`. | `Cursor resource_exhausted (gRPC quota) is a limit, so failover moves off the spent account` |
+| 34 | **A live catalog sync is not lost when `only-active` is on.** Hidden providers keep a fresh copy of their models, so `/multi-account switch` right after startup still shows the newly discovered ids (`kimi-k3`, …) instead of the old pre-sync list. | `a catalog sync refreshes the only-active hidden copy, so an immediate switch shows fresh models` |
 
 ## How to keep this honest
 

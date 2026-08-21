@@ -3869,6 +3869,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			registerCodexCatalog(pi, provider, allKnown as Array<Record<string, unknown>>);
 		}
 		if (changed) persist();
+		// Catalogs just changed while some providers may be hidden by only-active. Re-apply the
+		// filter NOW so the stored hidden copies hold the FRESH lists — otherwise a manual switch
+		// that lands before the next message_start would restore the stale pre-sync models.
+		applyOnlyActiveFilter(ctx);
 	}
 
 	/**
@@ -3947,6 +3951,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				models: ollamaRotationModelIds().map((m) => ollamaModelDef(m, provider)) as any,
 			} as any);
 		}
+		// Same repair as the Codex sync: keep only-active hidden copies fresh immediately.
+		applyOnlyActiveFilter(ctx);
 	}
 
 	function cachedUsage(provider: string): UsageSnapshot | undefined {
@@ -7794,6 +7800,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// cold catalog, a compaction inner session, or a git-reset leftover can still
 		// leave getModel(cursor, grok-4.6) empty.
 		if (cursorReady) await cursorReady.catch(() => undefined);
+		// Cursor slot catalogs changed too — same stale-hidden-copy repair as the model syncs.
+		applyOnlyActiveFilter(ctx);
 		await restoreRememberedModel(ctx);
 		await ensureReadyModel(
 			ctx,
