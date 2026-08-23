@@ -15,6 +15,16 @@ import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import {
+  clearConversationRegistry,
+  conversationStates,
+  deriveBridgeKeyFromSessionId,
+  deriveConversationKeyFromSessionId,
+  deterministicConversationId,
+  dropConversation,
+  forgetConversation,
+  type StoredConversation,
+} from "./conversation-registry.ts";
+import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
@@ -157,13 +167,7 @@ interface ActiveBridge {
   currentTurn: ParsedTurn;
 }
 
-export interface StoredConversation {
-  conversationId: string;
-  checkpoint: Uint8Array | null;
-  sessionScoped: boolean;
-  blobStore: Map<string, Uint8Array>;
-  lastAccessMs: number;
-}
+export type { StoredConversation };
 
 interface StreamState {
   toolCallIndex: number;
@@ -213,7 +217,6 @@ interface ParsedMessages {
 // ── State ──
 
 const activeBridges = new Map<string, ActiveBridge>();
-const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
@@ -586,7 +589,7 @@ export function cleanupAllSessionState(): void {
   for (const [bridgeKey, active] of activeBridges) {
     cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   }
-  conversationStates.clear();
+  clearConversationRegistry();
 }
 
 export function stopProxy(): void {
@@ -1398,13 +1401,7 @@ export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_
   return trimmed ? trimmed : undefined;
 }
 
-export function deriveBridgeKeyFromSessionId(sessionId: string): string {
-  return createHash("sha256").update(`bridge:${sessionId}`).digest("hex").slice(0, 16);
-}
-
-export function deriveConversationKeyFromSessionId(sessionId: string): string {
-  return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
-}
+export { deriveBridgeKeyFromSessionId, deriveConversationKeyFromSessionId, deterministicConversationId };
 
 export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): string {
   if (sessionId) return deriveBridgeKeyFromSessionId(sessionId);
@@ -1427,17 +1424,33 @@ export function cleanupSessionState(sessionId?: string): void {
   const active = activeBridges.get(bridgeKey);
   debugLog("session.cleanup", { sessionId, bridgeKey, convKey, hasActiveBridge: !!active, hadConversation: conversationStates.has(convKey) });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
-  conversationStates.delete(convKey);
+  dropConversation(convKey);
 }
 
-export function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256").update(`cursor-conv-id:${convKey}`).digest("hex").slice(0, 32);
-  return [
-    hex.slice(0, 8), hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
+/**
+ * Pi just compacted this session. Pi now holds a short summary, but Cursor is still sitting on
+ * the full pre-compaction conversation behind its checkpoint — and will keep answering from it,
+ * and keep reporting its size, as if nothing was compacted. Drop the checkpoint and move to a
+ * fresh conversation id so the next request is rebuilt from Pi's compacted turns.
+ *
+ * The in-flight bridge has to go too: a pending tool result would otherwise resume the very
+ * conversation we are trying to leave behind.
+ */
+export function resetConversationForSession(sessionId?: string): void {
+  if (!sessionId) return;
+  const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const active = activeBridges.get(bridgeKey);
+  const hadConversation = forgetConversation(convKey);
+  debugLog("conversation.reset_after_compaction", {
+    sessionId,
+    bridgeKey,
+    convKey,
+    hadConversation,
+    hasActiveBridge: !!active,
+    nextConversationId: deterministicConversationId(convKey),
+  });
+  if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
 }
 
 // ── Thinking tag filter ──

@@ -25,7 +25,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.ts";
-import { cleanupSessionState, getCursorModels, startProxy, stopProxy, type CursorModel } from "./proxy.ts";
+import { cleanupSessionState, getCursorModels, resetConversationForSession, startProxy, stopProxy, type CursorModel } from "./proxy.ts";
 import { registerSessionLifecycleHooks } from "./session-lifecycle.ts";
 
 // ── Cost estimation ──
@@ -384,6 +384,7 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   registerSessionLifecycleHooks(pi, {
     cleanupSessionState,
+    resetConversationForSession,
     stopProxy,
     debug: debugExtensionLog,
   });

@@ -49,6 +49,7 @@ import {
 	refreshCursorCredentials,
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
+import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
 
 // ---------------------------------------------------------------------------
 // pi-ai OAuth bridge (version-agnostic)
@@ -6360,6 +6361,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						typeof result.summary === "string" &&
 						result.summary.trim()
 					) {
+						// Pi drops the accumulated summary when a compaction lands with no
+						// history left to summarize — put it back before the entry is saved.
+						if (droppedPreviousSummary(result.summary, preparation.previousSummary)) {
+							logEvent("compaction_summary_repaired", {
+								provider: model.provider,
+								previousSummaryChars: preparation.previousSummary.length,
+								droppedSummaryChars: result.summary.length,
+							});
+							result.summary = restorePreviousSummary(
+								result.summary,
+								preparation.previousSummary,
+							);
+						}
 						compactionRoutedNote = `compacted on ${model.provider}`;
 						logEvent("compaction_routed", {
 							to: model.provider,

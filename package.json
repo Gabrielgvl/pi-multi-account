@@ -46,6 +46,7 @@
     "usage.ts",
     "cursor-bridge.ts",
     "cursor-model-name.ts",
+    "compaction-summary.ts",
     "cursor",
     "README.md",
     "CHANGELOG.md",

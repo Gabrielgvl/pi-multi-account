@@ -23,12 +23,28 @@ test("Cursor prompt tokens are estimated from the request when the stream report
 	assert.equal(usage.total_tokens, estimated + 12);
 });
 
-test("Cursor tokenDetails still win over the request estimate", () => {
+test("Cursor's own conversation counter must never be reported as the prompt we sent", () => {
+	// Real numbers from the dialer session on 2026-08-23, one reply after a successful
+	// compaction: Cursor answered usedTokens = 208 632 for a payload of ~53 000 tokens,
+	// because usedTokens counts Cursor's server-side conversation, not our request. Pi read
+	// that as its own context size, blew past its 200k window and compacted again — every
+	// turn, forever.
 	const usage = resolveCursorUsage({
-		outputTokens: 20,
-		totalTokens: 500,
-		promptTokenEstimate: 9999,
+		outputTokens: 552,
+		totalTokens: 208_632,
+		promptTokenEstimate: 53_000,
 	});
+	assert.equal(usage.prompt_tokens, 53_000);
+	assert.equal(usage.completion_tokens, 552);
+	assert.equal(usage.total_tokens, 53_552);
+	assert.ok(
+		usage.total_tokens < 184_000,
+		"anything above contextWindow - reserveTokens re-triggers auto-compaction",
+	);
+});
+
+test("Cursor tokenDetails are still used when we could not measure the request", () => {
+	const usage = resolveCursorUsage({ outputTokens: 20, totalTokens: 500 });
 	assert.equal(usage.prompt_tokens, 480);
 	assert.equal(usage.completion_tokens, 20);
 	assert.equal(usage.total_tokens, 500);
