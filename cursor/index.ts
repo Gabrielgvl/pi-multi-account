@@ -25,7 +25,8 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.ts";
-import { cleanupSessionState, getCursorModels, startProxy, type CursorModel } from "./proxy.ts";
+import { cleanupSessionState, getCursorModels, startProxy, stopProxy, type CursorModel } from "./proxy.ts";
+import { registerSessionLifecycleHooks } from "./session-lifecycle.ts";
 
 // ── Cost estimation ──
 
@@ -381,18 +382,11 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 // ── Extension ──
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
-  const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
-    debugExtensionLog("session.cleanup_hook", {
-      sessionId: ctx.sessionManager.getSessionId(),
-      leafId: ctx.sessionManager.getLeafId?.(),
-    });
-    cleanupSessionState(ctx.sessionManager.getSessionId());
-  };
-
-  pi.on("session_before_switch", cleanupCurrentSession);
-  pi.on("session_before_fork", cleanupCurrentSession);
-  pi.on("session_before_tree", cleanupCurrentSession);
-  pi.on("session_shutdown", cleanupCurrentSession);
+  registerSessionLifecycleHooks(pi, {
+    cleanupSessionState,
+    stopProxy,
+    debug: debugExtensionLog,
+  });
 }
 
 function registerExtensionDebugHooks(pi: ExtensionAPI) {

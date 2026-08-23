@@ -217,6 +217,7 @@ function setup(opts: {
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
 		registrations: [] as Array<{ provider: string; models: number | undefined }>,
+		catalogSnapshots: [] as any[],
 		aborts: 0,
 		authReloads: 0,
 	};
@@ -242,6 +243,7 @@ function setup(opts: {
 	};
 	let idle = opts.idle ?? true;
 	const events: Record<string, (event: any, ctx?: any) => any> = {};
+	const busEvents = new Map<string, Array<(payload: any) => void>>();
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
 
 	const ctx: any = {
@@ -305,6 +307,17 @@ function setup(opts: {
 	};
 
 	const pi: any = {
+		events: {
+			on: (name: string, handler: (payload: any) => void) => {
+				const handlers = busEvents.get(name) ?? [];
+				handlers.push(handler);
+				busEvents.set(name, handlers);
+			},
+			emit: (name: string, payload: any) => {
+				if (name === "pi:model-catalog:snapshot:v1") rec.catalogSnapshots.push(payload);
+				for (const handler of busEvents.get(name) ?? []) handler(payload);
+			},
+		},
 		registerProvider: (name: string, providerConfig?: { models?: any[] }) => {
 			known.add(name);
 			providerConfigs.set(name, providerConfig);
@@ -4650,6 +4663,32 @@ test("reload disabling Codex discovery replaces cached alias models with host mo
 	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate limit");
 	assert.equal(t.rec.setModels.at(-1), provider + "/gpt-5.7-sol");
 	await t.fire("session_shutdown");
+});
+
+test("credential-free catalog snapshots preserve account-specific Codex availability", async () => {
+	const accounts = {
+		"openai-codex": { type: "oauth", access: "base", refresh: "base-r", accountId: "base" },
+		"openai-codex-account-5": { type: "oauth", access: "five", refresh: "five-r", accountId: "five" },
+	};
+	const model = (id: string) => ({ id, name: id, reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 272000, maxTokens: 128000 });
+	const t = setup({
+		accounts,
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { autoDiscoverModels: true, onlyActive: true },
+		seedState: {
+			stateVersion: 5,
+			codexModelCatalogByProvider: {
+				"openai-codex": { fetchedAt: Date.now(), models: [model("gpt-5.6-sol"), model("gpt-5.6-terra")] },
+				"openai-codex-account-5": { fetchedAt: Date.now(), models: [model("gpt-5.6-terra"), model("gpt-5.5")] },
+			},
+		},
+	});
+	await t.fire("session_start");
+	const snapshot = t.rec.catalogSnapshots.at(-1);
+	const base = snapshot.models.filter((entry: any) => entry.provider === "openai-codex").map((entry: any) => entry.id);
+	const account5 = snapshot.models.filter((entry: any) => entry.provider === "openai-codex-account-5").map((entry: any) => entry.id);
+	assert.ok(base.includes("gpt-5.6-sol"));
+	assert.deepEqual(account5.sort(), ["gpt-5.5", "gpt-5.6-terra"]);
 });
 
 test(

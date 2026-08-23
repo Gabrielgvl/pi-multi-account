@@ -871,6 +871,8 @@ const ANTI_PINGPONG_MS = 60 * 1000; // don't switch straight back to the account
 // which version Pi actually loaded (a running Pi keeps the version it started with — /login and
 // /reload do NOT reload extension code; only a full restart does).
 const VERSION = "1.19.3";
+const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
+const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 const TRANSIENT_PENDING_PREFIX = "temporary provider failure:";
 // Pending reason for a turn that was NOT a model/account failure — the prior turn simply had
 // not gone idle in time, so we re-arm to resume the SAME model. This must never be treated as
@@ -3043,6 +3045,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	};
 	/** Settles once Cursor fallback models are registered. Pi awaits the factory return, so createAgentSession can getModel(cursor, grok-4.6) instead of falling back. */
 	let cursorReady: Promise<unknown> | undefined;
+	let modelCatalogContext: any;
 
 	// ----- only-active model filter -------------------------------------------
 	// When enabled, /model shows only the active rotation account: every other
@@ -3709,6 +3712,51 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return [...byId.values()].sort(compareCodexModelStrength);
 	}
 
+	/** Publish a credential-free, account-specific model snapshot over Pi's neutral event bus.
+	 * Hidden providers are included, while each Codex account's live catalog overrides any
+	 * base-provider fallback. No extension name, credential, quota or account identity is sent. */
+	function emitModelCatalogSnapshot(ctx: any) {
+		const auth = readAuthFile();
+		const byProvider = new Map<string, any[]>();
+		const put = (model: any) => {
+			if (!model || typeof model.provider !== "string" || typeof model.id !== "string" || !auth[model.provider]) return;
+			const list = byProvider.get(model.provider) ?? [];
+			if (!list.some((entry) => entry.id === model.id)) list.push(model);
+			byProvider.set(model.provider, list);
+		};
+		try {
+			for (const model of ctx?.modelRegistry?.getAll?.() ?? []) put(model);
+		} catch { /* runtime catalog is best effort; hidden/live snapshots follow */ }
+		for (const models of hiddenProviderModels.values()) for (const model of models) put(model);
+		for (const [provider, snapshot] of codexModelCatalogByProvider) {
+			if (!auth[provider] || !snapshot.models.length) continue;
+			const template = byProvider.get(provider)?.[0] ?? byProvider.get(CODEX_BASE)?.[0] ?? {};
+			byProvider.set(provider, snapshot.models.map((model) => ({
+				...model,
+				provider,
+				api: template.api ?? "openai-codex-responses",
+				baseUrl: template.baseUrl,
+			})));
+		}
+		const models = [...byProvider]
+			.sort(([left], [right]) => left.localeCompare(right))
+			.flatMap(([, providerModels]) => providerModels)
+			.map((model) => ({
+				provider: model.provider,
+				id: model.id,
+				name: model.name ?? model.id,
+				api: model.api,
+				baseUrl: model.baseUrl,
+				reasoning: model.reasoning !== false,
+				input: Array.isArray(model.input) ? model.input : ["text"],
+				contextWindow: model.contextWindow,
+				maxTokens: model.maxTokens,
+			}));
+		pi.events?.emit?.(MODEL_CATALOG_SNAPSHOT_EVENT, { schemaVersion: 1, models });
+	}
+
+	pi.events?.on?.(MODEL_CATALOG_REQUEST_EVENT, () => emitModelCatalogSnapshot(modelCatalogContext));
+
 	/**
 	 * Offline Codex ordering: everything the HOST (Pi) knows about the Codex provider, merged
 	 * with our static list and sorted strongest-first.
@@ -3869,6 +3917,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			registerCodexCatalog(pi, provider, allKnown as Array<Record<string, unknown>>);
 		}
 		if (changed) persist();
+		emitModelCatalogSnapshot(ctx);
 		// Catalogs just changed while some providers may be hidden by only-active. Re-apply the
 		// filter NOW so the stored hidden copies hold the FRESH lists — otherwise a manual switch
 		// that lands before the next message_start would restore the stale pre-sync models.
@@ -7753,6 +7802,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	safeOn("session_start", async (_event, ctx) => {
+		modelCatalogContext = ctx;
 		preflightHostCapabilities(ctx);
 		refreshDiscovery(true, ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
@@ -7802,6 +7852,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (cursorReady) await cursorReady.catch(() => undefined);
 		// Cursor slot catalogs changed too — same stale-hidden-copy repair as the model syncs.
 		applyOnlyActiveFilter(ctx);
+		emitModelCatalogSnapshot(ctx);
 		await restoreRememberedModel(ctx);
 		await ensureReadyModel(
 			ctx,
@@ -7814,6 +7865,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// by a new/resumed/forked session) — the extension's background activity must end with it.
 	// Kill every timer and drop the pending continuation so nothing survives the session.
 	safeOn("session_shutdown", async (_event, ctx) => {
+		modelCatalogContext = undefined;
 		rememberUserModel(ctx?.model);
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
