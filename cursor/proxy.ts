@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
+import { type BridgeHandle, type BridgeStreams, createBridgeHandle } from "./bridge-handle.ts";
 import {
   clearConversationRegistry,
   conversationStates,
@@ -147,14 +148,7 @@ interface PendingExec {
   decodedArgs: string;
 }
 
-interface BridgeHandle {
-  proc: Pick<ChildProcess, "kill">;
-  readonly alive: boolean;
-  write(data: Uint8Array): void;
-  end(): void;
-  onData(cb: (chunk: Buffer) => void): void;
-  onClose(cb: (code: number) => void): void;
-}
+export type { BridgeHandle };
 
 export type BridgeFactory = (options: SpawnBridgeOptions) => BridgeHandle;
 
@@ -308,13 +302,6 @@ let proxyAccessTokenProvider: ((req?: IncomingMessage) => Promise<string>) | und
 
 // ── Bridge spawn ──
 
-function lpEncode(data: Uint8Array): Buffer {
-  const buf = Buffer.alloc(4 + data.length);
-  buf.writeUInt32BE(data.length, 0);
-  buf.set(data, 4);
-  return buf;
-}
-
 function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   const frame = Buffer.alloc(5 + data.length);
   frame[0] = flags;
@@ -342,56 +329,13 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     path: options.rpcPath,
     unary: options.unary ?? false,
   });
-  proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
-
-  const cbs = {
-    data: null as ((chunk: Buffer) => void) | null,
-    close: null as ((code: number) => void) | null,
-  };
-
-  let exited = false;
-  let exitCode = 1;
-
-  let pending = Buffer.alloc(0);
-  proc.stdout!.on("data", (chunk: Buffer) => {
-    pending = Buffer.concat([pending, chunk]);
-    while (pending.length >= 4) {
-      const len = pending.readUInt32BE(0);
-      if (pending.length < 4 + len) break;
-      const payload = pending.subarray(4, 4 + len);
-      pending = pending.subarray(4 + len);
-      cbs.data?.(Buffer.from(payload));
-    }
+  // Built before the config frame goes out, so even the very first write is covered by the
+  // handle's error listeners rather than being able to throw at the host.
+  const handle = createBridgeHandle(proc as unknown as BridgeStreams, {
+    debug: (event, data) => debugLog(event, { rpcPath: options.rpcPath, ...data }),
   });
-
-  proc.on("exit", (code) => {
-    exited = true;
-    exitCode = code ?? 1;
-    debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
-    cbs.close?.(exitCode);
-  });
-
-  return {
-    proc,
-    get alive() { return !exited; },
-    write(data: Uint8Array) {
-      try { proc.stdin!.write(lpEncode(data)); } catch {}
-    },
-    end() {
-      try {
-        proc.stdin!.write(lpEncode(new Uint8Array(0)));
-        proc.stdin!.end();
-      } catch {}
-    },
-    onData(cb: (chunk: Buffer) => void) { cbs.data = cb; },
-    onClose(cb: (code: number) => void) {
-      if (exited) {
-        queueMicrotask(() => cb(exitCode));
-      } else {
-        cbs.close = cb;
-      }
-    },
-  };
+  handle.write(new TextEncoder().encode(config));
+  return handle;
 }
 
 // ── Unary RPC (for model discovery) ──
@@ -539,6 +483,10 @@ export async function startProxy(
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://localhost`);
       const requestId = nextDebugRequestId();
+      // Same rule as the bridge pipe: a socket that dies under us is a logged event, never an
+      // uncaught exception in the host process.
+      res.on("error", (error) => debugLog("http.response_error", { requestId, error: String(error) }));
+      req.on("error", (error) => debugLog("http.request_error", { requestId, error: String(error) }));
       debugLog("http.request", { requestId, method: req.method, pathname: url.pathname, headers: req.headers });
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -560,6 +508,12 @@ export async function startProxy(
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           debugLog("http.chat.error", { requestId, message, stack: err instanceof Error ? err.stack : undefined });
+          // Streaming may already have sent headers — writing them again throws from inside
+          // the catch, and that throw escapes as an unhandled rejection.
+          if (res.headersSent || res.writableEnded) {
+            if (!res.writableEnded) res.end();
+            return;
+          }
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }));
         }
@@ -569,6 +523,12 @@ export async function startProxy(
       res.writeHead(404);
       res.end("Not Found");
     });
+
+    server.on("clientError", (error, socket) => {
+      debugLog("http.client_error", { error: String(error) });
+      socket.destroy();
+    });
+    server.on("error", (error) => debugLog("http.server_error", { error: String(error) }));
 
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
