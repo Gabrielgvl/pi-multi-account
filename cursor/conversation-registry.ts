@@ -24,6 +24,30 @@ export interface StoredConversation {
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+  /**
+   * How many completed turns of Pi's transcript this conversation has actually seen. Cursor
+   * answers from its own copy of the history, so anything that happened while the session was
+   * on another provider is invisible to it — and rotation moves the session between accounts
+   * constantly. See {@link isStaleForTranscript}.
+   */
+  turnsCovered: number;
+}
+
+/**
+ * Has the session moved on without Cursor?
+ *
+ * Between two consecutive requests on this conversation the transcript grows by at most one
+ * completed turn — the one we just answered. A bigger jump means turns were completed
+ * somewhere Cursor never saw: a failover to another provider and back, a branch, another
+ * client. Its checkpoint is then a conversation with a hole in it, and resuming from it hands
+ * the model a past that is missing whatever happened while it was away.
+ *
+ * Rebuilding costs tokens; resuming a stale checkpoint costs correctness, silently. So the
+ * doubt is resolved toward rebuilding.
+ */
+export function isStaleForTranscript(stored: StoredConversation, completedTurns: number): boolean {
+  if (!stored.checkpoint) return false;
+  return completedTurns > stored.turnsCovered + 1;
 }
 
 export const conversationStates = new Map<string, StoredConversation>();

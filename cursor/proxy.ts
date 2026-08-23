@@ -36,6 +36,7 @@ import {
 import {
   clearConversationRegistry,
   conversationStates,
+  isStaleForTranscript,
   deriveBridgeKeyFromSessionId,
   deriveConversationKeyFromSessionId,
   deterministicConversationId,
@@ -664,6 +665,19 @@ async function handleChatCompletion(
 
   let stored = conversationStates.get(convKey);
   debugLog("chat.stored_state.before", { requestId, convKey, stored });
+  // Rotation moves the session between providers mid-conversation. While it is away, Cursor
+  // sees nothing — so a checkpoint that predates that excursion would resume a past with a
+  // hole in it. Detect the jump and start clean instead.
+  if (stored && isStaleForTranscript(stored, parsed.turns.length)) {
+    debugLog("conversation.stale_checkpoint", {
+      requestId,
+      convKey,
+      turnsCovered: stored.turnsCovered,
+      completedTurns: parsed.turns.length,
+    });
+    forgetConversation(convKey);
+    stored = undefined;
+  }
   if (!stored) {
     stored = {
       conversationId: deterministicConversationId(convKey),
@@ -672,9 +686,11 @@ async function handleChatCompletion(
       sessionScoped: !!sessionId,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
+      turnsCovered: parsed.turns.length,
     };
     conversationStates.set(convKey, stored);
   }
+  stored.turnsCovered = parsed.turns.length;
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 

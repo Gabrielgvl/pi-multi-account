@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	conversationStates,
+	isStaleForTranscript,
 	deterministicConversationId,
 	deriveConversationKeyFromSessionId,
 	forgetConversation,
@@ -38,6 +39,7 @@ function seedConversation(sessionId: string): StoredConversation {
 		sessionScoped: true,
 		blobStore: new Map(),
 		lastAccessMs: Date.now(),
+		turnsCovered: 0,
 	};
 	conversationStates.set(convKey, stored);
 	return stored;
@@ -158,4 +160,30 @@ test("restorePreviousSummary leaves healthy summaries and empty inputs alone", (
 	assert.equal(restorePreviousSummary(healthy, "previous"), healthy);
 	assert.equal(restorePreviousSummary("No prior history.\n\n---\n\nx", undefined), "No prior history.\n\n---\n\nx");
 	assert.equal(restorePreviousSummary("No prior history.\n\n---\n\nx", "   "), "No prior history.\n\n---\n\nx");
+});
+
+test("a checkpoint that missed turns taken on another provider is not resumed", () => {
+	// Rotation ran the session on Anthropic for three turns; Cursor saw none of them.
+	const stored = {
+		conversationId: "c", checkpoint: new Uint8Array([1]), sessionScoped: true,
+		blobStore: new Map(), lastAccessMs: 0, turnsCovered: 4,
+	};
+	assert.equal(isStaleForTranscript(stored, 7), true, "resuming here hands the model a past with a hole in it");
+});
+
+test("normal progress — one completed turn at a time — keeps the conversation", () => {
+	const stored = {
+		conversationId: "c", checkpoint: new Uint8Array([1]), sessionScoped: true,
+		blobStore: new Map(), lastAccessMs: 0, turnsCovered: 4,
+	};
+	assert.equal(isStaleForTranscript(stored, 4), false, "a tool continuation completes no turn");
+	assert.equal(isStaleForTranscript(stored, 5), false, "one finished turn is the normal step");
+});
+
+test("with no checkpoint there is nothing to go stale", () => {
+	const stored = {
+		conversationId: "c", checkpoint: null, sessionScoped: true,
+		blobStore: new Map(), lastAccessMs: 0, turnsCovered: 0,
+	};
+	assert.equal(isStaleForTranscript(stored, 99), false);
 });
