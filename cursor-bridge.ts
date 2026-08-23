@@ -184,3 +184,28 @@ export async function setupCursorSubscription(
 	});
 	return proxyPort;
 }
+
+/**
+ * Refresh a Cursor OAuth credential through the VENDORED provider.
+ *
+ * This used to `import()` `~/.pi/agent/git/github.com/ndraiman/pi-cursor-provider/auth.ts`
+ * — a path that no longer exists for anyone (the provider is vendored into this
+ * extension, and upstream's repo never contained the file layout we expected).
+ * Every forced Cursor refresh therefore threw before it could refresh anything.
+ * Resolving through {@link getCursorProviderRoot} keeps the `PI_CURSOR_PROVIDER_ROOT`
+ * test seam working.
+ */
+export async function refreshCursorCredentials(
+	refreshToken: string,
+): Promise<{ access: string; refresh: string; expires: number }> {
+	const entry = join(getCursorProviderRoot(), "auth.ts");
+	if (!existsSync(entry)) {
+		throw new Error(`Cursor support is missing from this install (${entry})`);
+	}
+	const mod = (await import(/* @vite-ignore */ loadSpecifier(entry))) as {
+		refreshCursorToken: (
+			token: string,
+		) => Promise<{ access: string; refresh: string; expires: number }>;
+	};
+	return mod.refreshCursorToken(refreshToken);
+}

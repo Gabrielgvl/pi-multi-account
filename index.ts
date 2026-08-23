@@ -26,7 +26,9 @@
 
 import { createHash } from "node:crypto";
 import {
+	accessSync,
 	appendFileSync,
+	constants as fsConstants,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -43,6 +45,7 @@ import {
 	CURSOR_BASE,
 	isCursorProviderId,
 	isCursorProviderInstalled,
+	refreshCursorCredentials,
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
 
@@ -1756,6 +1759,89 @@ function readAuthFile(): Record<string, AuthEntry> {
 	}
 }
 
+/** Atomic replace of auth.json, so a crash mid-write can never truncate credentials. */
+function writeAuthFile(data: Record<string, AuthEntry>): void {
+	const tmp = `${AUTH_PATH}.multi-account.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	renameSync(tmp, AUTH_PATH);
+}
+
+function authFileIsWritable(): boolean {
+	try {
+		accessSync(AUTH_PATH, fsConstants.W_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Can a refreshed credential be written back AT ALL?
+ *
+ * This must be answered BEFORE the network refresh, never after. Anthropic rotates the
+ * refresh token on every refresh call and revokes the old one immediately, so a refresh
+ * we cannot persist does not "fail" — it DESTROYS the account's credential and throws the
+ * replacement away. That is exactly what happened on pi 0.84.x, whose `AuthStorage` dropped
+ * the `set()` method this extension used to persist with: the post-refresh guard tripped
+ * every time, and the user lost their Claude login roughly once a day.
+ */
+export function canPersistRefreshedCredentials(
+	authStorage: any,
+	authWritable: () => boolean = authFileIsWritable,
+): boolean {
+	return (
+		typeof authStorage?.modify === "function" ||
+		typeof authStorage?.set === "function" ||
+		authWritable()
+	);
+}
+
+/**
+ * Write a refreshed OAuth credential back, through whichever path this host actually offers.
+ *
+ * `modify` is the locked, supported API in current pi and is tried first. `set` covers older
+ * hosts (and the test harness). The direct auth.json write is the last resort that exists
+ * only so a token we already rotated is never dropped on the floor — losing it means a
+ * forced re-login, which is the failure this whole function exists to prevent.
+ */
+export async function persistRefreshedCredentials(
+	authStorage: any,
+	provider: string,
+	credential: Record<string, unknown>,
+	io?: {
+		read?: () => Record<string, any>;
+		write?: (data: Record<string, any>) => void;
+	},
+): Promise<boolean> {
+	if (typeof authStorage?.modify === "function") {
+		try {
+			await authStorage.modify(provider, () => credential);
+			return true;
+		} catch {
+			// Locked or read-only storage — fall through to the remaining paths.
+		}
+	}
+	if (typeof authStorage?.set === "function") {
+		try {
+			authStorage.set(provider, credential);
+			return true;
+		} catch {
+			// Same.
+		}
+	}
+	try {
+		const read = io?.read ?? readAuthFile;
+		const write = io?.write ?? writeAuthFile;
+		write({ ...read(), [provider]: credential });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function authMtimeMs(): number {
 	try {
 		return statSync(AUTH_PATH).mtimeMs;
@@ -2754,7 +2840,7 @@ const MINIMAL_ANTHROPIC_OAUTH_PROMPT = [
 ].join("\n");
 const CLAUDE_CODE_IDENTITY_PREFIX =
 	"You are Claude Code, Anthropic's official CLI";
-const CLAUDE_CODE_VERSION = "2.1.226";
+const CLAUDE_CODE_VERSION = "2.1.241";
 const BILLING_HEADER_SALT = "59cf53e54c78";
 const BILLING_HEADER_POSITIONS = [4, 7, 20] as const;
 const CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
@@ -3611,6 +3697,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (typeof authStorage?.forceRefreshProvider === "function") {
 			return authStorage.forceRefreshProvider(provider);
 		}
+		// Refuse to refresh at all if the result has nowhere to go: the refresh itself
+		// revokes the token currently on disk.
+		if (!canPersistRefreshedCredentials(authStorage)) {
+			return { status: "unsupported" };
+		}
 
 		const family = classifyProvider(provider, config.qwenProvider);
 		try {
@@ -3630,22 +3721,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					),
 				);
 			} else if (family === "cursor") {
-				const authMod = await import(
-					join(AGENT_DIR, "git/github.com/ndraiman/pi-cursor-provider/auth.ts")
-				);
 				refreshed = mergeRefreshedCredentials(
 					entry,
-					await authMod.refreshCursorToken(entry.refresh),
+					await refreshCursorCredentials(entry.refresh),
 				);
 			} else {
 				return { status: "unsupported" };
 			}
 
-			if (!refreshed?.access || typeof authStorage?.set !== "function") {
+			if (!refreshed?.access) {
 				return {
 					status: "transient",
-					error:
-						"OAuth refresh returned no usable access token or AuthStorage cannot persist it",
+					error: "OAuth refresh returned no usable access token",
 				};
 			}
 			if (
@@ -3659,7 +3746,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				};
 			}
 
-			authStorage.set(provider, { type: "oauth", ...entry, ...refreshed });
+			const persisted = await persistRefreshedCredentials(authStorage, provider, {
+				type: "oauth",
+				...entry,
+				...refreshed,
+			});
+			if (!persisted) {
+				// The refresh already rotated the token server-side, so the old one on
+				// disk is dead either way. Say so instead of pretending it is transient.
+				return {
+					status: "terminal",
+					error:
+						"OAuth refresh succeeded but the rotated credential could not be written to auth.json; run /login for this account",
+				};
+			}
 			reloadHostAuth(ctx);
 			refreshDiscovery(true, ctx);
 			return { status: "refreshed" };

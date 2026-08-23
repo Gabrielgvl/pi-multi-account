@@ -38,9 +38,33 @@ export function registerCursorProvider(pi, id, _port, models) {
 }
 `;
 
+// Cursor's OAuth refresh, as the vendored provider exposes it (`auth.ts` next to
+// `cursor-shared.ts`). It rotates the refresh token — like Anthropic and Cursor really do —
+// and records every call, so a test can prove a token was NOT burned.
+const CURSOR_REFRESH_LOG = join(AGENT_DIR, "cursor-refresh-calls.json");
+const CURSOR_AUTH_STUB = `import { appendFileSync } from "node:fs";
+export async function refreshCursorToken(token) {
+	appendFileSync(${JSON.stringify(CURSOR_REFRESH_LOG)}, JSON.stringify(token) + "\\n");
+	return { access: "rotated-access:" + token, refresh: "rotated-refresh:" + token, expires: 4102444800000 };
+}
+`;
+
+function cursorRefreshCalls(): string[] {
+	if (!existsSync(CURSOR_REFRESH_LOG)) return [];
+	return readFileSync(CURSOR_REFRESH_LOG, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as string);
+}
+
 function installCursorProvider() {
 	mkdirSync(CURSOR_ROOT, { recursive: true });
 	writeFileSync(join(CURSOR_ROOT, "cursor-shared.ts"), CURSOR_PROVIDER_STUB);
+	// The forced-refresh path imports this from the SAME root — it used to import it from
+	// ~/.pi/agent/git/github.com/ndraiman/pi-cursor-provider/auth.ts, a path that no longer
+	// exists for anyone since the provider was vendored (issue #20).
+	writeFileSync(join(CURSOR_ROOT, "auth.ts"), CURSOR_AUTH_STUB);
+	rmSync(CURSOR_REFRESH_LOG, { force: true });
 }
 
 function uninstallCursorProvider() {
@@ -53,13 +77,28 @@ function uninstallCursorProvider() {
 
 const {
 	default: piMultiAccount,
+	canPersistRefreshedCredentials,
 	mergeRefreshedCredentials,
 	modelIdentityKey,
+	persistRefreshedCredentials,
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
 	default: (pi: any) => void;
+	canPersistRefreshedCredentials: (
+		authStorage: any,
+		authWritable?: () => boolean,
+	) => boolean;
 	mergeRefreshedCredentials: (credentials: any, refreshed: any) => any;
 	modelIdentityKey: (modelId: string) => string;
+	persistRefreshedCredentials: (
+		authStorage: any,
+		provider: string,
+		credential: Record<string, unknown>,
+		io?: {
+			read?: () => Record<string, any>;
+			write?: (data: Record<string, any>) => void;
+		},
+	) => Promise<boolean>;
 	sameModelIdentity: (a: string | undefined, b: string | undefined) => boolean;
 };
 
@@ -159,6 +198,15 @@ function setup(opts: {
 	thinkingCaps?: Record<string, string>;
 	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
 	settings?: { defaultProvider: string; defaultModel: string };
+	/**
+	 * Shape of the host's AuthStorage.
+	 *
+	 * "pi-0.84" is the REAL surface of pi 0.84.x: `read`/`modify`/`delete`/`list`/`reload`,
+	 * and neither the `set()` this extension used to persist with nor a host-side
+	 * `forceRefreshProvider`. Every other test uses the convenience stub that provides
+	 * `forceRefreshProvider`, which short-circuits the extension's own refresh path.
+	 */
+	hostAuthStorage?: "pi-0.84";
 }) {
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
@@ -279,20 +327,58 @@ function setup(opts: {
 						]
 					);
 				}),
-			authStorage: {
-				reload: () => {
-					rec.authReloads++;
-				},
-				forceRefreshProvider: async (provider: string) =>
-					opts.forceRefreshResults?.[provider] ?? {
-						status: "terminal",
-						error: "refresh_token_invalidated: session has ended",
-					},
-				hasAuth: (provider: string) => {
-					const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
-					return !!(entry?.key || entry?.access);
-				},
-			},
+			authStorage:
+				opts.hostAuthStorage === "pi-0.84"
+					? {
+							reload: () => {
+								rec.authReloads++;
+							},
+							read: async (provider: string) =>
+								JSON.parse(readFileSync(AUTH, "utf8"))[provider],
+							list: async () =>
+								Object.entries(
+									JSON.parse(readFileSync(AUTH, "utf8")) as Record<string, any>,
+								).map(([providerId, credential]) => ({
+									providerId,
+									type: credential.type,
+								})),
+							modify: async (
+								provider: string,
+								fn: (current: any) => any | Promise<any>,
+							) => {
+								const data = JSON.parse(readFileSync(AUTH, "utf8"));
+								const next = await fn(data[provider]);
+								if (next === undefined) return data[provider];
+								writeFileSync(
+									AUTH,
+									JSON.stringify({ ...data, [provider]: next }, null, 2),
+								);
+								return next;
+							},
+							delete: async (provider: string) => {
+								const data = JSON.parse(readFileSync(AUTH, "utf8"));
+								delete data[provider];
+								writeFileSync(AUTH, JSON.stringify(data, null, 2));
+							},
+							hasAuth: (provider: string) => {
+								const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
+								return !!(entry?.key || entry?.access);
+							},
+						}
+					: {
+							reload: () => {
+								rec.authReloads++;
+							},
+							forceRefreshProvider: async (provider: string) =>
+								opts.forceRefreshResults?.[provider] ?? {
+									status: "terminal",
+									error: "refresh_token_invalidated: session has ended",
+								},
+							hasAuth: (provider: string) => {
+								const entry = JSON.parse(readFileSync(AUTH, "utf8"))[provider];
+								return !!(entry?.key || entry?.access);
+							},
+						},
 			getProviderAuthStatus: (provider: string) => ({
 				configured: known.has(provider),
 			}),
@@ -6759,4 +6845,173 @@ test("when nothing is confirmed, best says the choice is a guess", async () => {
 		/not confirmed|cannot be checked|unverified|no quota/i,
 		`it must not present a guess as a verified choice; said: ${said}`,
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Forced OAuth refresh: a rotated token must never be thrown away (issue #22)
+// ---------------------------------------------------------------------------
+//
+// Anthropic (and Cursor) rotate the refresh token on every refresh call and revoke the old
+// one immediately. So a forced refresh we cannot PERSIST does not merely fail — it destroys
+// the account's credential and discards the replacement. On pi 0.84.x that is exactly what
+// happened: `AuthStorage` no longer exposes the `set()` this extension persisted with, the
+// post-refresh guard tripped every single time, and the user lost their Claude login roughly
+// once a day, needing a manual `/login`.
+
+test("a refreshed credential is persisted through pi 0.84's AuthStorage, which has no set()", async () => {
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "stale", refresh: "live-refresh" },
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+		},
+		config: { includeCursor: true },
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+		hostAuthStorage: "pi-0.84",
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"cursor",
+		"cursor-grok-4.6",
+		"Your authentication token has been invalidated. Please try signing in again.",
+	);
+
+	const stored = JSON.parse(readFileSync(AUTH, "utf8")).cursor;
+	assert.equal(
+		stored.refresh,
+		"rotated-refresh:live-refresh",
+		"the rotated refresh token must reach auth.json — the old one is already dead server-side",
+	);
+	assert.equal(stored.access, "rotated-access:live-refresh");
+	assert.ok(
+		!t.readState().invalidatedByProvider?.cursor,
+		"a successful refresh is not a dead account",
+	);
+	assert.deepEqual(
+		t.rec.setModels,
+		[],
+		"and a successful refresh stays on the same account",
+	);
+	uninstallCursorProvider();
+});
+
+test("with nowhere to persist, the token is never rotated in the first place", async () => {
+	// The order matters more than the outcome: checking persistence AFTER the network call
+	// is what burned the credential. A host that cannot store the result must never get as
+	// far as asking the provider to rotate it.
+	assert.equal(
+		canPersistRefreshedCredentials({ read: async () => undefined }, () => false),
+		false,
+		"read-only storage plus an unwritable auth.json means no refresh may be attempted",
+	);
+	assert.equal(
+		canPersistRefreshedCredentials({ modify: async () => {} }, () => false),
+		true,
+		"pi 0.84's modify() is a persistence path",
+	);
+	assert.equal(
+		canPersistRefreshedCredentials({ set: () => {} }, () => false),
+		true,
+		"and so is the older set()",
+	);
+	assert.equal(
+		canPersistRefreshedCredentials(undefined, () => true),
+		true,
+		"no AuthStorage at all still leaves our own writable auth.json",
+	);
+});
+
+test("persistence falls through modify -> set -> auth.json instead of dropping the token", async () => {
+	const credential = { type: "oauth", access: "new", refresh: "new-refresh" };
+
+	const modified: any[] = [];
+	assert.equal(
+		await persistRefreshedCredentials(
+			{
+				modify: async (provider: string, fn: (current: any) => any) => {
+					modified.push({ provider, next: await fn(undefined) });
+				},
+				set: () => assert.fail("modify succeeded; set must not be called"),
+			},
+			"anthropic",
+			credential,
+		),
+		true,
+	);
+	assert.deepEqual(modified, [{ provider: "anthropic", next: credential }]);
+
+	// A host whose modify() throws (locked file, read-only storage) must still land the token.
+	const setCalls: any[] = [];
+	assert.equal(
+		await persistRefreshedCredentials(
+			{
+				modify: async () => {
+					throw new Error("Read-only credential storage cannot modify auth.json");
+				},
+				set: (provider: string, value: any) => setCalls.push({ provider, value }),
+			},
+			"anthropic",
+			credential,
+		),
+		true,
+	);
+	assert.deepEqual(setCalls, [{ provider: "anthropic", value: credential }]);
+
+	// Neither method exists: write auth.json ourselves rather than lose a rotated token.
+	let written: any;
+	assert.equal(
+		await persistRefreshedCredentials({ reload: () => {} }, "anthropic", credential, {
+			read: () => ({ "openai-codex": { type: "oauth", access: "keep" } }),
+			write: (data) => {
+				written = data;
+			},
+		}),
+		true,
+	);
+	assert.deepEqual(written, {
+		"openai-codex": { type: "oauth", access: "keep" },
+		anthropic: credential,
+	});
+
+	// And when nothing can store it, say so — never report a refresh that did not stick.
+	assert.equal(
+		await persistRefreshedCredentials({}, "anthropic", credential, {
+			read: () => ({}),
+			write: () => {
+				throw new Error("EROFS");
+			},
+		}),
+		false,
+	);
+});
+
+test("a forced Cursor refresh loads the vendored provider, not the retired clone path", async () => {
+	// Cursor's refresh used to be imported from
+	// ~/.pi/agent/git/github.com/ndraiman/pi-cursor-provider/auth.ts — a path that stopped
+	// existing when the provider was vendored into this extension (issue #20), so every
+	// forced Cursor refresh threw before it could refresh anything.
+	installCursorProvider();
+	const t = setup({
+		accounts: {
+			cursor: { type: "oauth", access: "stale", refresh: "cursor-refresh-token" },
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+		},
+		config: { includeCursor: true },
+		current: { provider: "cursor", id: "cursor-grok-4.6" },
+		hostAuthStorage: "pi-0.84",
+	});
+	await t.fire("session_start");
+	await finishError(
+		t,
+		"cursor",
+		"cursor-grok-4.6",
+		"Your authentication token has been invalidated. Please try signing in again.",
+	);
+	assert.deepEqual(
+		cursorRefreshCalls(),
+		["cursor-refresh-token"],
+		"the refresh must actually reach the vendored provider's auth module",
+	);
+	uninstallCursorProvider();
 });
