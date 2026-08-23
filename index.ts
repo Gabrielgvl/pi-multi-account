@@ -43,6 +43,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_BASE,
+	CURSOR_PROXY_PLACEHOLDER_KEY,
 	isCursorProviderId,
 	isCursorProviderInstalled,
 	refreshCursorCredentials,
@@ -695,6 +696,14 @@ type NativeProviderEntry = {
 	baseUrl: string;
 	models: unknown[];
 	compat?: Record<string, unknown>;
+	/**
+	 * Key written into models.json for this slot. Pi refuses to use a provider it has
+	 * no credential for — `credentials_not_configured` — so a slot we publish without
+	 * one resolves the model and then cannot call it. Only ever a non-secret
+	 * placeholder for a LOCAL proxy that supplies the real token itself; a real
+	 * credential must never be copied into models.json.
+	 */
+	apiKey?: string;
 };
 
 /**
@@ -775,6 +784,7 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 			baseUrl: entry.baseUrl,
 			models,
 		};
+		if (entry.apiKey) normalized.apiKey = entry.apiKey;
 		if (entry.compat) normalized.compat = entry.compat;
 		const raw = existsSync(MODELS_CONFIG_PATH)
 			? readFileSync(MODELS_CONFIG_PATH, "utf8")
@@ -788,6 +798,7 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 		if (
 			existing?.baseUrl === normalized.baseUrl &&
 			existing?.api === normalized.api &&
+			existing?.apiKey === normalized.apiKey &&
 			JSON.stringify(existing?.models ?? []) === JSON.stringify(models)
 		) {
 			return; // already provisioned — do not touch the file
@@ -3134,12 +3145,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let modelCatalogContext: any;
 
 	// ----- only-active model filter -------------------------------------------
-	// When enabled, /model shows only the active rotation account: every other
-	// provider is re-registered with `models: []` (Pi merges re-registrations, so
-	// auth/OAuth config survives) and restored from here on switch or disable.
+	// When enabled, /model drops this extension's OTHER rotation slots: each is
+	// re-registered with `models: []` (Pi merges re-registrations, so auth/OAuth
+	// config survives) and restored from here on switch or disable.
+	//
+	// It may only ever narrow slots THIS extension invented. Pi's registry is the
+	// single place anything — Pi itself, another extension, a `--models` pattern —
+	// asks "does this model exist?", and re-registering a provider with no models
+	// answers "no" to every one of them. Emptying a provider Pi knows on its own
+	// (a built-in, a models.json entry, another extension's registration) therefore
+	// does not hide a model, it DELETES it: a pinned `zai/glm-5.1` stops resolving,
+	// and a caller that falls back to "just use the session model" silently starts
+	// running on whichever account rotation happens to be on. That is invisible from
+	// here and undebuggable from there. Slots we invented are ours to narrow —
+	// nothing else in Pi knows the name `openai-codex-account-3` — and every model
+	// Pi knows independently stays resolvable by reference while the filter is on.
 	let onlyActiveModels = config.onlyActive;
 	/** Models of the providers WE hid, freshest copy — the only way back. */
 	const hiddenProviderModels = new Map<string, any[]>();
+
+	/**
+	 * A provider that exists ONLY because this extension registered it. Pi has no
+	 * built-in and no models.json entry under a `-account-N` name unless we made it,
+	 * so narrowing these takes nothing away from anyone else.
+	 */
+	function isOwnRotationSlot(provider: string): boolean {
+		return /-account-\d+$/.test(provider);
+	}
 
 	function unhideProvider(provider: string) {
 		const models = hiddenProviderModels.get(provider);
@@ -3188,6 +3220,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				unhideProvider(provider);
 				continue;
 			}
+			// Not ours to remove: emptying it would unregister models Pi knows on its
+			// own, and every caller resolving one by reference would stop finding it.
+			if (!isOwnRotationSlot(provider)) continue;
 			if (!models.length) continue; // already hidden (or genuinely empty)
 			hiddenProviderModels.set(provider, models);
 			try {
@@ -5012,10 +5047,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				onProvision: (slots, port, models) => {
 					// models.json entries point at the running proxy, so a bare child
 					// `pi -p` resolves cursor/* while any parent Pi process is alive.
+					//
+					// The placeholder key is what makes that resolution USABLE. Pi refuses a
+					// provider it has no credential for, and Cursor's credential is an OAuth
+					// token this extension holds — a child cannot read it. The proxy already
+					// treats this exact value as "no token on the request" and falls back to
+					// the base slot's stored credential, so the child authenticates to a
+					// LOCAL socket with a non-secret string and the real token never leaves
+					// the parent. Without it a provisioned slot reports
+					// `credentials_not_configured` and every child call dies at auth.
 					for (const slot of slots) {
 						provisionNativeSlot(slot, {
 							api: "openai-completions",
 							baseUrl: `http://127.0.0.1:${port}/v1`,
+							apiKey: CURSOR_PROXY_PLACEHOLDER_KEY,
 							models,
 						});
 					}

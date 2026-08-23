@@ -7,6 +7,19 @@ const VENDORED_CURSOR_ROOT = join(dirname(fileURLToPath(import.meta.url)), "curs
 
 export const CURSOR_BASE = "cursor";
 
+/**
+ * The one bearer value the vendored proxy treats as "no usable token on this request",
+ * falling back to the base slot's stored credential (see `bearerFromRequest` in
+ * cursor/cursor-shared.ts). It is a marker, not a secret: the proxy listens on
+ * 127.0.0.1 only and supplies the real Cursor token itself.
+ *
+ * It exists so a slot published into pi's static models.json is USABLE by a bare
+ * `pi -p` child, which cannot read the OAuth token this extension holds. Locked to the
+ * vendored provider by a test — if the provider ever stops recognising this exact
+ * string, publishing it would silently send a bogus token instead.
+ */
+export const CURSOR_PROXY_PLACEHOLDER_KEY = "cursor-proxy";
+
 export function isCursorProviderId(id: string): boolean {
 	return id === CURSOR_BASE || /^cursor-account-\d+$/.test(id);
 }

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Narrowing `/model` no longer deletes models from Pi's registry.** `only-active` re-registered *every* non-active provider with `models: []`, including providers this extension never created — Pi's own built-ins, `models.json` entries, another extension's registration. That registry is the single place anything asks "does this model exist?", so emptying a provider did not hide a model, it removed it: a pinned `zai/glm-5.1` stopped resolving for everyone, and any caller that falls back to "then just use the session model" silently began running on whichever account rotation happened to be on — a different one every few turns, invisible from here and undebuggable from there. The filter now narrows only the rotation slots this extension invented (`*-account-N`, names Pi cannot know without us); every model Pi knows on its own stays resolvable by reference while `/model` is narrowed. `/model` consequently lists each family's base provider again — that is the part that was never ours to take away.
+- **A slot published into `models.json` is now usable there, not merely resolvable.** The Cursor slots were written into Pi's static registry so an extension-free `pi -p` child could resolve them, but with no key — and Pi refuses a provider it has no credential for, so every child call died at `credentials_not_configured` after the model resolved. Cursor's real credential is an OAuth token this extension holds and a child cannot read, so the published entry now carries the local proxy's own placeholder, which the proxy already treats as "no token on this request" and answers by supplying the real token itself. Verified end to end: a bare `pi -p --no-extensions` child with no `auth.json` at all completes a Cursor request through the proxy.
+
 ## [1.20.0] - 2026-08-23
 
 ### Added

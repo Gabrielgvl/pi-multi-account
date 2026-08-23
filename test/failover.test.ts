@@ -15,7 +15,8 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const AGENT_DIR = mkdtempSync(join(tmpdir(), "pmacct-test-"));
@@ -2908,10 +2909,20 @@ test("failover under only-active unhides the target before switching and re-narr
 		(codex?.models ?? 0) > 0,
 		"the new active account must be visible in /model again",
 	);
-	const anthropic = [...t.rec.registrations]
-		.reverse()
-		.find((r) => r.provider === "anthropic");
-	assert.equal(anthropic?.models, 0, "the spent account leaves /model");
+	// The spent account here is Pi's OWN `anthropic` provider, not a slot this extension
+	// invented, so the filter must leave it alone — see the only-active invariant below.
+	assert.ok(
+		![...t.rec.registrations].some(
+			(r) => r.provider === "anthropic" && r.models === 0,
+		),
+		"a provider Pi knows on its own is never emptied to narrow /model",
+	);
+	assert.ok(
+		[...t.rec.registrations].some(
+			(r) => r.provider === "openai-codex-account-2" && r.models === 0,
+		),
+		"the extension's own spare slot IS narrowed while another account is active",
+	);
 });
 
 test("only-active off restores every hidden provider", async () => {
@@ -7014,4 +7025,129 @@ test("a forced Cursor refresh loads the vendored provider, not the retired clone
 		"the refresh must actually reach the vendored provider's auth module",
 	);
 	uninstallCursorProvider();
+});
+
+// ---------------------------------------------------------------------------
+// The registry is Pi's, not ours: narrowing /model must not delete models
+// ---------------------------------------------------------------------------
+//
+// Pi's model registry is the single place ANYTHING — Pi itself, a `--models` pattern,
+// another extension pinning a model by reference — asks "does this model exist?".
+// Re-registering a provider with `models: []` answers "no" to every one of them, so
+// emptying a provider Pi knows on its own does not hide a model, it deletes it. The
+// caller then falls back to whatever the session is running on, which under rotation is
+// a different account every few turns: invisible from here, undebuggable from there.
+
+test("only-active never makes a model Pi knows on its own unresolvable", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c2",
+				refresh: "cr2",
+				accountId: "codex-2",
+			},
+			// A provider Pi knows from models.json / its own built-ins. This extension
+			// never registered it and must never unregister it.
+			zai: { type: "api_key", key: "sk-zai" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active on");
+
+	// Exactly how an outside caller resolves a pinned model.
+	const resolvable = (provider: string) =>
+		t.ctx.modelRegistry
+			.getAll()
+			.some((model: { provider: string }) => model.provider === provider);
+
+	assert.ok(
+		resolvable("zai"),
+		"a pinned zai/* model must still resolve while /model is narrowed",
+	);
+	assert.ok(
+		resolvable("anthropic"),
+		"and so must Pi's own anthropic provider, even though it is not the active one",
+	);
+	assert.ok(
+		!resolvable("openai-codex-account-2"),
+		"this extension's own spare slot is what only-active narrows",
+	);
+});
+
+test("only-active empties this extension's own slots and nothing else, ever", async () => {
+	// The blast radius, stated as a rule rather than per provider: a name with an
+	// `-account-N` suffix exists only because this extension registered it, so narrowing
+	// it takes nothing away from Pi. Every other name in the registry came from
+	// somewhere else and is not ours to unregister.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c2",
+				refresh: "cr2",
+				accountId: "codex-2",
+			},
+			zai: { type: "api_key", key: "sk-zai" },
+			openrouter: { type: "api_key", key: "sk-or" },
+			ollama: { type: "api_key", key: "sk-ollama" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	await t.command("only-active on");
+	const emptied = [
+		...new Set(
+			[...t.rec.registrations]
+				.filter((r) => r.models === 0)
+				.map((r) => r.provider),
+		),
+	];
+	assert.deepEqual(
+		emptied.filter((provider) => !/-account-\d+$/.test(provider)),
+		[],
+		`only-active emptied a provider it did not invent: ${emptied.join(", ")}`,
+	);
+});
+
+test("a slot published into models.json is usable by a bare child, not just resolvable", async () => {
+	// Publishing a provider Pi cannot authenticate is worse than not publishing it: the
+	// model resolves and every call then dies at `credentials_not_configured`. Cursor's
+	// real credential is an OAuth token this extension holds and a child cannot read, so
+	// the published entry carries the proxy's own placeholder — the proxy recognises it
+	// and supplies the real token itself.
+	installCursorProvider();
+	const t = setup({
+		accounts: { cursor: { type: "oauth", access: "c", refresh: "cr" } },
+		config: { includeCursor: true },
+	});
+	await t.fire("session_start");
+	await wait(20);
+	const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers?.cursor;
+	assert.ok(slot, "the cursor slot must be provisioned into models.json");
+	assert.equal(
+		slot.apiKey,
+		"cursor-proxy",
+		"without a key Pi refuses the provider it can otherwise resolve",
+	);
+	assert.match(slot.baseUrl, /^http:\/\/127\.0\.0\.1:\d+\/v1$/);
+	uninstallCursorProvider();
+});
+
+test("the published placeholder is the one the vendored proxy actually accepts", async () => {
+	// The placeholder only works because cursor/cursor-shared.ts treats this exact string
+	// as "no token on this request". If the vendored provider ever stops doing that,
+	// publishing it would send a bogus bearer instead of falling back to the real token.
+	const shared = readFileSync(
+		join(dirname(fileURLToPath(import.meta.url)), "..", "cursor", "cursor-shared.ts"),
+		"utf8",
+	);
+	assert.match(
+		shared,
+		/token === "cursor-proxy"/,
+		"the vendored proxy must still recognise the placeholder we publish",
+	);
 });
