@@ -30,8 +30,10 @@ import {
 	CONTINUATION_PROMPT,
 	actionTextForRebuild,
 	requestActionText,
+	allPriorTurns,
 	historyForRebuild,
 	parseMessages,
+	renderTurnsAsText,
 	type OpenAIMessage,
 } from "../cursor/message-parsing.ts";
 
@@ -55,24 +57,27 @@ test("the in-flight turn survives the rebuild instead of being thrown away", () 
 	assert.ok(parsed.pendingTurn, "the turn whose tools just returned must be kept");
 	assert.equal(parsed.pendingTurn.userText, "Порахуй рядки у файлі даних.");
 
-	const history = historyForRebuild(parsed);
-	const replayed = JSON.stringify(history);
+	// It must reach the model through the request message, not through blob-referenced history.
+	const sent = requestActionText(parsed, { hasCheckpoint: false });
 
-	assert.ok(replayed.includes("Порахуй рядки"), "the user's actual question must reach the model");
-	assert.ok(replayed.includes("wc -l data.jsonl"), "the tool call the assistant already made must reach the model");
-	assert.ok(replayed.includes("17980"), "the tool result must reach the model — this is the work that was lost");
+	assert.ok(sent.includes("Порахуй рядки"), "the user's actual question must reach the model");
+	assert.ok(sent.includes("wc -l data.jsonl"), "the tool call the assistant already made must reach the model");
+	assert.ok(sent.includes("17980"), "the tool result must reach the model — this is the work that was lost");
+	assert.deepEqual(historyForRebuild(parsed), [], "nothing may be left to the channel that can drop it");
 });
 
 test("the rebuild no longer re-asks the original question as if nothing had happened", () => {
 	const parsed = parseMessages(MID_TURN);
 
 	// The old behaviour: `userText || results` → the question again, tool results discarded.
+	const sent = actionTextForRebuild(parsed);
 	assert.notEqual(
-		actionTextForRebuild(parsed),
+		sent,
 		"Порахуй рядки у файлі даних.",
 		"re-asking the question makes the model redo work it already did",
 	);
-	assert.equal(actionTextForRebuild(parsed), CONTINUATION_PROMPT);
+	assert.ok(sent.endsWith(CONTINUATION_PROMPT), "the ask must be to continue, and it comes last");
+	assert.ok(sent.includes("17980"), "with the work that was already done in front of it");
 });
 
 test("after compaction the summary is history, not a new user request", () => {
@@ -93,15 +98,13 @@ test("after compaction the summary is history, not a new user request", () => {
 	];
 
 	const parsed = parseMessages(afterCompaction);
-	const history = JSON.stringify(historyForRebuild(parsed));
+	const sent = requestActionText(parsed, { hasCheckpoint: false });
 
-	assert.ok(history.includes("Поставити на карту"), "the compaction summary must survive the rebuild");
-	assert.ok(history.includes("pins-2026-08-23.jsonl"), "the tool result from the interrupted turn must survive");
-	assert.notEqual(
-		actionTextForRebuild(parsed),
-		`[compaction]\n\n${summary}`,
-		"handing the summary over as the user's new request is what made the agent act at random",
-	);
+	// This is the whole point: the summary has to be inside the message the model answers.
+	assert.ok(sent.includes("Поставити на карту"), "the compaction summary must reach the model itself");
+	assert.ok(sent.includes("pins-2026-08-23.jsonl"), "the tool result from the interrupted turn must reach it too");
+	assert.notEqual(sent, `[compaction]\n\n${summary}`, "and not be handed over as the user's new request");
+	assert.ok(sent.includes("Continue the work above"), "the model must be told to continue, not to start over");
 });
 
 test("a plain new question is still just that question", () => {
@@ -113,11 +116,10 @@ test("a plain new question is still just that question", () => {
 	]);
 
 	assert.equal(parsed.pendingTurn, undefined, "nothing is in flight here");
-	assert.equal(actionTextForRebuild(parsed), "Друге питання.");
-	// The completed turn is replayed, the new question is not duplicated into history.
-	const history = historyForRebuild(parsed);
-	assert.equal(history.length, 1);
-	assert.equal(history[0].userText, "Перше питання.");
+	const sent = requestActionText(parsed, { hasCheckpoint: false });
+	assert.ok(sent.endsWith("Друге питання."), "the new question stays the actual ask");
+	assert.ok(sent.includes("Перше питання."), "and the earlier exchange is restored as context");
+	assert.ok(sent.includes("Перша відповідь."));
 });
 
 test("tool results are still surfaced for the live resume path", () => {
@@ -141,18 +143,16 @@ test("a multi-tool turn keeps every call and every result", () => {
 		{ role: "tool", tool_call_id: "b", content: "result-two" },
 	]);
 
-	const replayed = JSON.stringify(historyForRebuild(parsed));
+	const sent = requestActionText(parsed, { hasCheckpoint: false });
 	for (const fragment of ["Роблю обидві.", "one", "two", "result-one", "result-two"]) {
-		assert.ok(replayed.includes(fragment), `${fragment} must survive the rebuild`);
+		assert.ok(sent.includes(fragment), `${fragment} must survive the rebuild`);
 	}
 });
 
 test("history and completed turns are never double-counted", () => {
 	const parsed = parseMessages(MID_TURN);
-	const history = historyForRebuild(parsed);
-	assert.equal(history.length, parsed.turns.length + 1);
-	// historyForRebuild must not mutate the parsed turns it was handed.
-	assert.equal(parsed.turns.length, 0);
+	assert.equal(allPriorTurns(parsed).length, parsed.turns.length + 1);
+	assert.equal(parsed.turns.length, 0, "allPriorTurns must not mutate what it was handed");
 });
 
 test("when Cursor keeps its own history, the tool results travel in the request itself", () => {
@@ -169,8 +169,8 @@ test("when we rebuild the history ourselves, the results are not sent twice", ()
 	const parsed = parseMessages(MID_TURN);
 	const text = requestActionText(parsed, { hasCheckpoint: false });
 
-	assert.equal(text, CONTINUATION_PROMPT);
-	assert.ok(!text.includes("17980"), "the results are already in the replayed history");
+	assert.ok(text.includes(CONTINUATION_PROMPT), "the ask is still a continuation");
+	assert.equal(text.split("17980").length - 1, 1, "the result appears once, in the restored context");
 });
 
 test("a plain question is unaffected by who holds the history", () => {
@@ -179,5 +179,23 @@ test("a plain question is unaffected by who holds the history", () => {
 		{ role: "user", content: "Просте питання." },
 	]);
 	assert.equal(requestActionText(parsed, { hasCheckpoint: true }), "Просте питання.");
-	assert.equal(requestActionText(parsed, { hasCheckpoint: false }), "Просте питання.");
+	assert.equal(
+		requestActionText(parsed, { hasCheckpoint: false }),
+		"Просте питання.",
+		"a brand new conversation has nothing to restore, so nothing is wrapped around it",
+	);
+});
+
+test("the rendered transcript keeps order, tool arguments and outputs", () => {
+	const text = renderTurnsAsText([
+		{ userText: "Питання.", steps: [
+			{ kind: "assistantText", text: "Думка." },
+			{ kind: "toolCall", toolCallId: "t1", toolName: "bash", arguments: { command: "ls" }, result: { content: "out", isError: false } },
+			{ kind: "toolCall", toolCallId: "t2", toolName: "read", arguments: { path: "a.ts" }, result: { content: "boom", isError: true } },
+		] },
+	]);
+	assert.ok(text.indexOf("Питання.") < text.indexOf("Думка."), "order must be preserved");
+	assert.ok(text.includes('bash({"command":"ls"})'));
+	assert.ok(text.includes("result: out"));
+	assert.ok(text.includes("error: boom"), "a failed tool must not read as a successful one");
 });

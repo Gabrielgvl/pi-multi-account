@@ -221,45 +221,93 @@ export function parseMessages(
 }
 
 /**
- * The history to replay when Cursor's own conversation cannot be resumed.
+ * Rebuilding a conversation Cursor has no memory of.
  *
- * The in-flight turn is part of the history here: by the time we rebuild, its tool calls have
- * already run and their results are known, so it is a completed turn as far as the model is
- * concerned. Leaving it out is what made a restored session — and every post-compaction
- * turn — start over with no idea what had just happened.
+ * There are two ways to put words in front of the model, and they are not equally reliable:
+ *
+ *   - the request's own user message travels inline in the request — it is how the first turn
+ *     of every conversation works, so it always arrives;
+ *   - history turns travel as sha256 blob IDs. The words themselves stay on our side, and
+ *     Cursor has to come back over the KV channel and ask for each blob. If it does not ask,
+ *     or asks for something we do not hold, nothing surfaces and nothing complains: a missing
+ *     blob is answered with an empty result.
+ *
+ * Replaying the restored session as history therefore put the compaction summary somewhere the
+ * model could not read it — present in Pi's chat, invisible to Cursor. So the rebuild does not
+ * use history at all: everything the model needs is rendered into the message it is answering,
+ * through the channel that cannot silently drop it.
  */
-export function historyForRebuild(parsed: Pick<ParsedMessages, "turns" | "pendingTurn">): ParsedTurn[] {
+
+const CONTEXT_OPEN = "=== RESTORED SESSION CONTEXT ===";
+const CONTEXT_CLOSE = "=== END RESTORED SESSION CONTEXT ===";
+
+function renderStep(step: ParsedTurnStep): string {
+  if (step.kind === "assistantText") return `Assistant: ${step.text}`;
+  const args = JSON.stringify(step.arguments ?? {});
+  const call = `Assistant called ${step.toolName || "tool"}(${args})`;
+  if (!step.result) return `${call}\n  -> (no result recorded)`;
+  const label = step.result.isError ? "error" : "result";
+  return `${call}\n  -> ${label}: ${step.result.content}`;
+}
+
+/** A faithful plain-text transcript of everything that already happened. */
+export function renderTurnsAsText(turns: ParsedTurn[]): string {
+  const blocks: string[] = [];
+  for (const turn of turns) {
+    const lines: string[] = [];
+    if (turn.userText.trim()) lines.push(`User: ${turn.userText}`);
+    for (const step of turn.steps) lines.push(renderStep(step));
+    if (lines.length > 0) blocks.push(lines.join("\n"));
+  }
+  return blocks.join("\n\n");
+}
+
+/** The turns to replay as Cursor conversation history. Empty on the rebuild path — see above. */
+export function historyForRebuild(_parsed: Pick<ParsedMessages, "turns" | "pendingTurn">): ParsedTurn[] {
+  return [];
+}
+
+/** Every turn that already happened, in order, including the one still in flight. */
+export function allPriorTurns(parsed: Pick<ParsedMessages, "turns" | "pendingTurn">): ParsedTurn[] {
   return parsed.pendingTurn ? [...parsed.turns, parsed.pendingTurn] : [...parsed.turns];
 }
 
-/** Marker used as the request action when the in-flight turn already carries the real ask. */
-export const CONTINUATION_PROMPT =
-  "Continue from the tool results above. Do not repeat work that is already done.";
+const CONTINUATION_INSTRUCTION =
+  "Continue the work above from where it stopped. Do not repeat steps that are already done, "
+  + "and do not ask the user to repeat themselves — everything you need is in the context above.";
+
+export const CONTINUATION_PROMPT = CONTINUATION_INSTRUCTION;
 
 /**
  * What to send as the request's user message.
  *
- * Previously this was `userText || toolResults.join("\n")`, which had two failure modes and hit
- * one of them every time: with a user question present the tool results were dropped outright,
- * and without one the model got raw tool output as if the user had typed it.
- *
- * The right answer depends on who is holding the history. When we rebuild, the in-flight turn
- * (calls AND results) is replayed as history, so the action only has to say "carry on". When
- * Cursor resumes from its own checkpoint our history is ignored entirely — and that checkpoint
- * has the assistant's tool calls but not their results, because the stream died before they
- * were delivered — so the results themselves have to travel in the action.
+ * Rebuild path: the whole restored session is rendered into this text, because it is the only
+ * channel that reliably reaches the model. Checkpoint path: Cursor already holds the history
+ * and ignores ours, but its checkpoint has the assistant's tool calls without their results
+ * (the stream died before delivery), so the results travel here instead.
  */
 export function requestActionText(
-  parsed: Pick<ParsedMessages, "userText" | "toolResults" | "pendingTurn">,
+  parsed: Pick<ParsedMessages, "userText" | "toolResults" | "turns" | "pendingTurn">,
   options: { hasCheckpoint: boolean },
 ): string {
-  if (!parsed.pendingTurn) return parsed.userText;
-  if (!options.hasCheckpoint) return CONTINUATION_PROMPT;
-  const results = parsed.toolResults.map((result) => result.content).join("\n").trim();
-  return results ? `${CONTINUATION_PROMPT}\n\n${results}` : CONTINUATION_PROMPT;
+  if (options.hasCheckpoint) {
+    if (!parsed.pendingTurn) return parsed.userText;
+    const results = parsed.toolResults.map((r) => r.content).join("\n").trim();
+    return results ? `${CONTINUATION_INSTRUCTION}\n\n${results}` : CONTINUATION_INSTRUCTION;
+  }
+
+  const prior = allPriorTurns(parsed);
+  const transcript = renderTurnsAsText(prior);
+  // A brand new conversation has nothing to restore — send the question as-is.
+  if (!transcript) return parsed.userText;
+
+  const ask = parsed.pendingTurn ? CONTINUATION_INSTRUCTION : parsed.userText;
+  return `${CONTEXT_OPEN}\n${transcript}\n${CONTEXT_CLOSE}\n\n${ask}`;
 }
 
-/** @deprecated Use {@link requestActionText}; kept so the rebuild-only shape stays explicit. */
-export function actionTextForRebuild(parsed: Pick<ParsedMessages, "userText" | "toolResults" | "pendingTurn">): string {
+/** @deprecated Use {@link requestActionText}. */
+export function actionTextForRebuild(
+  parsed: Pick<ParsedMessages, "userText" | "toolResults" | "turns" | "pendingTurn">,
+): string {
   return requestActionText(parsed, { hasCheckpoint: false });
 }

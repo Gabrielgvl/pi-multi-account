@@ -1030,6 +1030,11 @@ function handleKvMessage(
     const blobId = (kvMsg as any).message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    // A blob we do not hold is answered with an empty result and no error, so a hole in the
+    // conversation looks exactly like a healthy one. Never let that be silent again.
+    if (!blobData) {
+      debugLog("kv.blob_miss", { blobIdKey, knownBlobs: blobStore.size });
+    }
     sendKvResponse(kvMsg, "getBlobResult", create(GetBlobResultSchema, blobData ? { blobData } : {}), sendFrame);
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = (kvMsg as any).message.value;
