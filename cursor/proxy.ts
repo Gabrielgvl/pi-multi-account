@@ -16,6 +16,24 @@ import { fileURLToPath } from "node:url";
 import { estimatePromptTokens, resolveCursorUsage } from "./prompt-usage.ts";
 import { type BridgeHandle, type BridgeStreams, createBridgeHandle } from "./bridge-handle.ts";
 import {
+  requestActionText,
+  historyForRebuild,
+  isToolCallStep,
+  parseMessages as parseMessagesPure,
+  parseToolCallArguments,
+  textContent,
+  type ContentPart,
+  type OpenAIMessage,
+  type OpenAIToolCall,
+  type ParsedAssistantTextStep,
+  type ParsedMessages,
+  type ParsedToolCallStep,
+  type ParsedToolResult,
+  type ParsedTurn,
+  type ParsedTurnStep,
+  type ToolResultInfo,
+} from "./message-parsing.ts";
+import {
   clearConversationRegistry,
   conversationStates,
   deriveBridgeKeyFromSessionId,
@@ -94,24 +112,6 @@ const BRIDGE_PATH = pathResolve(dirname(fileURLToPath(import.meta.url)), "h2-bri
 
 // ── Types ──
 
-interface OpenAIToolCall {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
-}
-
-interface ContentPart {
-  type: string;
-  text?: string;
-}
-
-interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null | ContentPart[];
-  tool_call_id?: string;
-  tool_calls?: OpenAIToolCall[];
-}
-
 interface OpenAIToolDef {
   type: "function";
   function: {
@@ -162,6 +162,10 @@ interface ActiveBridge {
 }
 
 export type { StoredConversation };
+export type {
+  ContentPart, OpenAIMessage, OpenAIToolCall, ParsedAssistantTextStep, ParsedMessages,
+  ParsedToolCallStep, ParsedToolResult, ParsedTurn, ParsedTurnStep, ToolResultInfo,
+};
 
 interface StreamState {
   toolCallIndex: number;
@@ -169,43 +173,6 @@ interface StreamState {
   outputTokens: number;
   totalTokens: number;
   promptTokenEstimate: number;
-}
-
-interface ToolResultInfo {
-  toolCallId: string;
-  content: string;
-}
-
-export interface ParsedToolResult {
-  content: string;
-  isError: boolean;
-}
-
-export interface ParsedAssistantTextStep {
-  kind: "assistantText";
-  text: string;
-}
-
-export interface ParsedToolCallStep {
-  kind: "toolCall";
-  toolCallId: string;
-  toolName: string;
-  arguments: Record<string, unknown>;
-  result?: ParsedToolResult;
-}
-
-export type ParsedTurnStep = ParsedAssistantTextStep | ParsedToolCallStep;
-
-export interface ParsedTurn {
-  userText: string;
-  steps: ParsedTurnStep[];
-}
-
-interface ParsedMessages {
-  systemPrompt: string;
-  userText: string;
-  turns: ParsedTurn[];
-  toolResults: ToolResultInfo[];
 }
 
 // ── State ──
@@ -640,7 +607,8 @@ async function handleChatCompletion(
   res: ServerResponse,
   requestId: string,
 ): Promise<void> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const parsed = parseMessages(body.messages);
+  const { systemPrompt, userText, turns, toolResults } = parsed;
   const modelId = resolveUsableModelId(resolveModelId(body.model, body.reasoning_effort));
   const tools = body.tools ?? [];
 
@@ -711,14 +679,18 @@ async function handleChatCompletion(
   evictStaleConversations();
 
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
+  // Cursor's own conversation is not available here, so the whole session is replayed from
+  // Pi's transcript. The turn that is still in flight — the assistant's tool calls and the
+  // results that just came back — is part of that history: dropping it and re-sending the
+  // original question makes the model redo work it already did, and dropping the question and
+  // sending raw tool output leaves it with no task at all.
+  const rebuiltTurns = historyForRebuild(parsed);
+  const effectiveUserText = requestActionText(parsed, { hasCheckpoint: !!stored.checkpoint });
   if (!stored.checkpoint) {
     debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
+    modelId, systemPrompt, effectiveUserText, rebuiltTurns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   debugLog("chat.cursor_request", {
@@ -747,28 +719,6 @@ async function handleChatCompletion(
 
 // ── Message parsing ──
 
-function textContent(content: OpenAIMessage["content"]): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
-}
-
-function parseToolCallArguments(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return { value: parsed };
-  } catch {
-    return raw ? { __raw: raw } : {};
-  }
-}
-
-function isToolCallStep(step: ParsedTurnStep): step is ParsedToolCallStep {
-  return step.kind === "toolCall";
-}
-
 function getTurnToolCallResults(turn: ParsedTurn): Map<string, ParsedToolResult> {
   const results = new Map<string, ParsedToolResult>();
   for (const step of turn.steps) {
@@ -787,116 +737,8 @@ function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
   }
 }
 
-function stripTurnRuntimeState(turn: ParsedTurn & {
-  toolCallById?: Map<string, ParsedToolCallStep>;
-  sawToolResult?: boolean;
-  sawAssistantAfterToolResult?: boolean;
-}): ParsedTurn {
-  return { userText: turn.userText, steps: turn.steps };
-}
-
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
-  let systemPrompt = "You are a helpful assistant.";
-  const turns: ParsedTurn[] = [];
-
-  debugLog("parse_messages.start", { messages });
-
-  const systemParts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content));
-  if (systemParts.length > 0) systemPrompt = systemParts.join("\n");
-
-  const nonSystem = messages.filter((m) => m.role !== "system");
-  let currentTurn: (ParsedTurn & {
-    toolCallById: Map<string, ParsedToolCallStep>;
-    sawToolResult: boolean;
-    sawAssistantAfterToolResult: boolean;
-  }) | null = null;
-
-  const finalizeCurrentTurn = () => {
-    if (!currentTurn) return;
-    turns.push(stripTurnRuntimeState(currentTurn));
-    currentTurn = null;
-  };
-
-  for (const msg of nonSystem) {
-    if (msg.role === "user") {
-      finalizeCurrentTurn();
-      currentTurn = {
-        userText: textContent(msg.content),
-        steps: [],
-        toolCallById: new Map(),
-        sawToolResult: false,
-        sawAssistantAfterToolResult: false,
-      };
-      continue;
-    }
-
-    if (!currentTurn) continue;
-
-    if (msg.role === "assistant") {
-      const text = textContent(msg.content);
-      if (text) {
-        if (currentTurn.sawToolResult) currentTurn.sawAssistantAfterToolResult = true;
-        currentTurn.steps.push({ kind: "assistantText", text });
-      }
-
-      for (const toolCall of msg.tool_calls ?? []) {
-        const step: ParsedToolCallStep = {
-          kind: "toolCall",
-          toolCallId: toolCall.id,
-          toolName: toolCall.function.name,
-          arguments: parseToolCallArguments(toolCall.function.arguments),
-        };
-        currentTurn.steps.push(step);
-        currentTurn.toolCallById.set(step.toolCallId, step);
-      }
-      continue;
-    }
-
-    if (msg.role === "tool") {
-      const toolCallId = msg.tool_call_id ?? "";
-      const content = textContent(msg.content);
-      const existing = toolCallId ? currentTurn.toolCallById.get(toolCallId) : undefined;
-      if (existing) {
-        existing.result = { content, isError: false };
-      } else {
-        const step: ParsedToolCallStep = {
-          kind: "toolCall",
-          toolCallId,
-          toolName: "",
-          arguments: {},
-          result: { content, isError: false },
-        };
-        currentTurn.steps.push(step);
-        if (toolCallId) currentTurn.toolCallById.set(toolCallId, step);
-      }
-      currentTurn.sawToolResult = true;
-    }
-  }
-
-  let userText = "";
-  let toolResults: ToolResultInfo[] = [];
-
-  if (currentTurn) {
-    const toolCallSteps = currentTurn.steps.filter(isToolCallStep);
-    const hasAnyToolResults = toolCallSteps.some((step) => step.result);
-    const lastStep = currentTurn.steps.at(-1);
-    const isToolContinuation = lastStep?.kind === "toolCall";
-
-    if (currentTurn.steps.length === 0 || isToolContinuation) {
-      userText = currentTurn.userText;
-      if (hasAnyToolResults) {
-        toolResults = toolCallSteps
-          .filter((step) => step.result)
-          .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content }));
-      }
-    } else {
-      turns.push(stripTurnRuntimeState(currentTurn));
-    }
-  }
-
-  const parsed = { systemPrompt, userText, turns, toolResults };
-  debugLog("parse_messages.end", parsed);
-  return parsed;
+  return parseMessagesPure(messages, debugLog);
 }
 
 // ── Tool definitions ──
