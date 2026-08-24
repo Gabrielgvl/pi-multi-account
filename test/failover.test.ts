@@ -7213,7 +7213,7 @@ test("the published placeholder is the one the vendored proxy actually accepts",
 // for a real summary only once the agent has settled.
 // ---------------------------------------------------------------------------
 
-/** A conversation shaped like the real 2026-08-20 run: mostly large tool results. */
+/** A conversation shaped like the real 78-minute run: mostly large tool results. */
 function bigConversation(turns: number) {
 	const messages: any[] = [
 		{ role: "user", content: [{ type: "text", text: "продовжуй" }], timestamp: 1 },

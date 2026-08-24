@@ -24,7 +24,7 @@ test("Cursor prompt tokens are estimated from the request when the stream report
 });
 
 test("Cursor's own conversation counter must never be reported as the prompt we sent", () => {
-	// Real numbers from the dialer session on 2026-08-23, one reply after a successful
+	// Real numbers from a real session, one reply after a successful
 	// compaction: Cursor answered usedTokens = 208 632 for a payload of ~53 000 tokens,
 	// because usedTokens counts Cursor's server-side conversation, not our request. Pi read
 	// that as its own context size, blew past its 200k window and compacted again — every

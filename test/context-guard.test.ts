@@ -6,9 +6,9 @@
  * autonomous "продовжуй" session spends essentially all of its time — nothing measures the
  * context at all.
  *
- * Measured in the user's own transcripts (18 sessions, ~96 MB, 2026-08-15..08-23):
+ * Measured across 18 real coding sessions (~96 MB of transcripts):
  *
- *   dialer session, 2026-08-20: ONE agent run between two user messages, 13:37 → 14:56.
+ *   ONE agent run between two user messages, 78 minutes long.
  *   586 records, 222 assistant messages, 360 tool results, 2 user messages.
  *   Reported context 85 663 → 542 529 against a 272 000 window. Zero compaction checks.
  *
@@ -285,7 +285,7 @@ test("planElision leaves a request that already fits completely alone", () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Rebuilds the shape of the 2026-08-20 run: 222 assistant turns, 360 tool results, ~86 % of the
+ * Rebuilds the shape of the 78-minute run: 222 assistant turns, 360 tool results, ~86 % of the
  * weight in tool results and ~12 % in tool-call arguments, ending far past the window.
  */
 function autonomousRun(): GuardMessage[] {

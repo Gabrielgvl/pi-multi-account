@@ -24,7 +24,7 @@ export function estimatePromptTokens(messages: unknown, tools?: unknown): number
  * that Pi's request is small while Cursor's number stays at the old size, and Pi reads its own
  * context as being over the window on every single turn.
  *
- * Real numbers from the dialer session on 2026-08-23, one reply after a completed compaction:
+ * Real numbers from a session, one reply after a completed compaction:
  * request ≈ 53 000 tokens, Cursor answered 208 632, Pi compacted again three minutes later and
  * lost its summary doing it.
  *

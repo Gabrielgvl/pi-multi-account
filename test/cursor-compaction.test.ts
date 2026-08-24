@@ -1,6 +1,5 @@
 /**
- * Compaction on Cursor was a treadmill, observed end-to-end in a real session
- * (dialer, 2026-08-23):
+ * Compaction on Cursor was a treadmill, observed end-to-end in a real session:
  *
  *   16:15:20  compaction succeeds, summary is 11 130 chars, real context ≈ 22k tokens
  *   16:16:16  next reply reports prompt_tokens = 208 080

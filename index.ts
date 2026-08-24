@@ -516,8 +516,8 @@ type ProviderFailoverConfig = {
 	// repeat. Default: true.
 	// Keep a request inside the model's context window WHILE the agent is working. Pi only checks
 	// whether to compact after a whole agent run has ended and before a new user prompt, so a long
-	// autonomous run is never measured: one run in the dialer session on 2026-08-20 grew from 85 663
-	// to 542 529 tokens against a 272 000 window with no check at all. `true`/absent uses the
+	// autonomous run is never measured: one 78-minute run grew from 85 663 to 542 529 tokens
+	// against a 272 000 window with no check at all. `true`/absent uses the
 	// defaults; an object overrides individual thresholds; `false` disables the guard entirely.
 	contextGuard?: boolean | Partial<ContextGuardSettings>;
 	preserveInterruptedContext?: boolean;
@@ -7938,9 +7938,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// retry branch of _handlePostAgentRun() and returns BEFORE the compaction check, so the one
 	// checkpoint that exists is routinely spent on a retry.
 	//
-	// Measured in this user's transcripts: one agent run (dialer, 2026-08-20, 13:37→14:56) grew
-	// from 85 663 to 542 529 tokens against a 272 000 window without a single check; across the
-	// corpus 30 % of all requests on gpt-5.6-sol went out above 100 % of the advertised window.
+	// Measured across 18 real sessions: one 78-minute agent run grew from 85 663 to 542 529 tokens
+	// against a 272 000 window without a single check; across the corpus 30 % of all requests on
+	// gpt-5.6-sol went out above 100 % of the advertised window.
 	//
 	// So the guard measures every outgoing request itself and, above the soft line, elides the
 	// oldest tool results out of THAT REQUEST ONLY — the session transcript is never touched. Real

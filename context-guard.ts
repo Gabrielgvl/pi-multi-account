@@ -8,12 +8,11 @@
  * run ("продовжуй") is one agent run no matter how many tool calls it makes, so for the entire
  * length of that run the context is unmeasured and unbounded.
  *
- * Measured in this user's own sessions (18 sessions, ~96 MB of transcripts, 2026-08-15..08-23):
+ * Measured across 18 real coding sessions (~96 MB of transcripts):
  *
- * - 2026-08-20, dialer session: ONE agent run between two user messages ran 13:37 → 14:56
- *   (586 records, 220 assistant turns, 360 tool results). Reported context went 85 663 → 542 529
- *   against a 272 000 window. No compaction check fired during it; compaction only ran once the
- *   run died.
+ * - ONE agent run between two user messages ran for 78 minutes (586 records, 220 assistant turns,
+ *   360 tool results). Reported context went 85 663 → 542 529 against a 272 000 window. No
+ *   compaction check fired during it; compaction only ran once the run died.
  * - On the main working model (gpt-5.6-sol, window 272 000): 48 % of all requests were sent above
  *   80 % of the window, 30 % above 100 %, 149 above 150 %. Same figures whether you count
  *   `totalTokens` or prompt-only (`input + cacheRead + cacheWrite`).
@@ -25,7 +24,7 @@
  *   step, never mind a big one.
  * - A retryable provider error consumes the one checkpoint there is: `_handlePostAgentRun()`
  *   takes the retry branch and returns BEFORE `_checkCompaction()`. In the run above a Codex 500
- *   at 13:52 was retried and the run carried on to 542 k unchecked.
+ *   partway through was retried and the run carried on to 542 k unchecked.
  * - Advertised windows are not usable windows. claude-opus-5 and kimi k3 declare 1 000 000+, so
  *   Pi's threshold lands at ~1 032 192 and auto-compaction can never fire on them; those sessions
  *   reached 717 813 and 547 203 tokens.

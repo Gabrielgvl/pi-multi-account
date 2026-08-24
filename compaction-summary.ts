@@ -8,8 +8,8 @@
  * to the model at all. The new compaction entry then replaces the accumulated summary with a
  * note about one truncated turn, and everything the session had learned is gone.
  *
- * Seen in the dialer session on 2026-08-23 at 16:18:32: an 11 130-char summary became 2 032
- * chars beginning "No prior history." and describing work from a different day.
+ * Seen in a real session: an 11 130-char summary became 2 032 chars beginning "No prior history."
+ * and describing work from a different day.
  *
  * We intercept compaction anyway (to route it to a healthy account), so the repair goes here:
  * put the previous summary back where the placeholder is, keeping the turn-prefix context Pi
