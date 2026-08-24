@@ -49,6 +49,7 @@
     "compaction-summary.ts",
     "context-guard.ts",
     "provider-priority.ts",
+    "child-usability.ts",
     "cursor",
     "README.md",
     "CHANGELOG.md",
