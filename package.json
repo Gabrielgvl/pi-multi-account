@@ -51,6 +51,7 @@
     "provider-priority.ts",
     "child-usability.ts",
     "pi-contract.ts",
+    "slot-proxy.ts",
     "cursor",
     "README.md",
     "CHANGELOG.md",

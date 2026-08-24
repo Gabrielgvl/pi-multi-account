@@ -14,6 +14,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7859,13 +7860,14 @@ test("after a switch, settings.json naming the live model is silent", async () =
 // What the rotation looks like to something that does NOT load this extension
 // ---------------------------------------------------------------------------
 
-test("status says which rotation slots an extension-free child cannot authenticate to", async () => {
+test("with the proxy off, status says which slots an extension-free child cannot authenticate to", async () => {
 	// Measured 2026-08-24: a numbered slot with an OAuth credential resolves by name and then
 	// fails with "No API key found", because Pi honours OAuth only for a provider definition that
 	// declares the flow. Publishing the name is not publishing a usable route.
 	rmSync(MODELS, { force: true });
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { childProxy: false },
 		accounts: {
 			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
 			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
@@ -7883,7 +7885,7 @@ test("status says which rotation slots an extension-free child cannot authentica
 	await t.fire("session_shutdown");
 });
 
-test("status warns when the account a bare child would pick up is one it cannot use", async () => {
+test("with the proxy off, status warns that the account a bare child picks up is unusable", async () => {
 	// settings.json is how anything spawned without this extension finds the active account. When
 	// that account is unusable the child does not fail — it silently runs on another vendor. This
 	// is the shape of the real incident: rotation on Codex, consolidation child on Anthropic.
@@ -7891,6 +7893,7 @@ test("status warns when the account a bare child would pick up is one it cannot 
 	const t = setup({
 		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
 		settings: { defaultProvider: "openai-codex-account-2", defaultModel: "gpt-5.5" },
+		config: { childProxy: false },
 	});
 	await t.fire("session_start");
 	t.rec.notifies.length = 0;
@@ -7930,6 +7933,241 @@ test("a slot published against a parent-owned loopback route counts as usable", 
 		);
 		await t.fire("session_shutdown");
 	} finally {
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("with the proxy on, the OAuth slots a child could not use become usable", async () => {
+	// The whole point of the parent-owned route: the slot the rotation chose is the slot the
+	// child runs on, instead of Pi's first-available provider on some other vendor.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		settings: { defaultProvider: "openai-codex-account-2", defaultModel: "gpt-5.5" },
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
+		},
+	});
+	try {
+		await t.fire("session_start");
+		t.rec.notifies.length = 0;
+		await t.command("status");
+		const status = t.rec.notifies.at(-1) ?? "";
+		assert.equal(
+			/cannot authenticate: [^\n]*openai-codex-account-2/.test(status),
+			false,
+			status,
+		);
+		assert.equal(/first-available provider/.test(status), false, status);
+
+		// And the route it was published against is this machine, with a non-secret placeholder —
+		// the real OAuth token must never be written into a file a child reads.
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"];
+		assert.ok(slot, "the slot must be published for a bare child to resolve it");
+		assert.equal(new URL(slot.baseUrl).hostname, "127.0.0.1");
+		// A key must be published or Pi refuses the provider outright; which shape it takes per
+		// family is covered by its own test.
+		assert.ok(typeof slot.apiKey === "string" && slot.apiKey.length > 0);
+		const published = readFileSync(MODELS, "utf8");
+		assert.equal(published.includes("c-tok-2"), false, "no real token in a published file");
+		assert.equal(published.includes("c-ref-2"), false);
+	} finally {
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+/** Talk to the running proxy the way a bare child would: plain HTTP on loopback. */
+function callProxy(
+	baseUrl: string,
+	path: string,
+	headers: Record<string, string>,
+	body = "{}",
+): Promise<{ status: number; body: string }> {
+	const url = new URL(baseUrl + path);
+	return new Promise((resolve, reject) => {
+		const req = httpRequest(
+			{
+				hostname: url.hostname,
+				port: url.port,
+				path: url.pathname + url.search,
+				method: "POST",
+				headers: { "content-type": "application/json", ...headers },
+			},
+			(res) => {
+				let text = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk) => {
+					text += chunk;
+				});
+				res.on("end", () => resolve({ status: res.statusCode ?? 0, body: text }));
+			},
+		);
+		req.on("error", reject);
+		req.end(body);
+	});
+}
+
+test("the proxy swaps the placeholder for the real token and never forwards the placeholder", async () => {
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "acct-9",
+			},
+		},
+	});
+	const realFetch = globalThis.fetch;
+	const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"];
+		assert.ok(slot?.baseUrl, "the slot must be published against the running proxy");
+
+		globalThis.fetch = (async (input: any, init: any) => {
+			seen.push({ url: String(input), headers: { ...(init?.headers ?? {}) } });
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+
+		const response = await callProxy(slot.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${slot.apiKey}`,
+			// Pi fills this in from the placeholder it was given; the proxy must replace it.
+			"chatgpt-account-id": "pi-multi-account-proxy",
+		});
+		assert.equal(response.status, 200);
+		assert.equal(seen.length, 1, "the request must reach the upstream exactly once");
+		assert.equal(seen[0].url, "https://chatgpt.com/backend-api/codex/responses");
+		// The real credential is added here and only here — a child never holds it.
+		assert.equal(seen[0].headers.authorization, "Bearer c-tok-2");
+		assert.equal(seen[0].headers["chatgpt-account-id"], "acct-9");
+		assert.equal(
+			JSON.stringify(seen[0].headers).includes(slot.apiKey),
+			false,
+			"the placeholder must never travel upstream",
+		);
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("the proxy refuses a caller that did not come from a slot we published", async () => {
+	// A loopback port is reachable by every process on this machine, and what sits behind it is
+	// the user's subscription. Anything that cannot present the published placeholder is refused
+	// before a single upstream call is made.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
+		},
+	});
+	const realFetch = globalThis.fetch;
+	let upstreamCalls = 0;
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"];
+		globalThis.fetch = (async () => {
+			upstreamCalls++;
+			return new Response("{}", { status: 200 });
+		}) as typeof fetch;
+
+		const noKey = await callProxy(slot.baseUrl, "/codex/responses", {});
+		assert.equal(noKey.status, 401);
+		const wrongKey = await callProxy(slot.baseUrl, "/codex/responses", {
+			authorization: "Bearer sk-someone-elses-key",
+		});
+		assert.equal(wrongKey.status, 401);
+		// Nor may the refusal repeat back what was presented — refusals get logged.
+		assert.equal(wrongKey.body.includes("sk-someone-elses-key"), false);
+
+		const port = new URL(slot.baseUrl).port;
+		const unknownSlot = await callProxy(`http://127.0.0.1:${port}/anthropic-account-9`, "/v1/messages", {
+			authorization: `Bearer ${slot.apiKey}`,
+		});
+		assert.equal(unknownSlot.status, 404);
+
+		assert.equal(upstreamCalls, 0, "no refused request may reach an upstream");
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("the proxy refuses a WebSocket upgrade so Pi falls back to SSE without a wasted round trip", async () => {
+	// Measured on a real bare child: Pi's Codex API tries a WebSocket first and only then POSTs
+	// over SSE. Forwarding that attempt upstream would spend a request that could never work.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
+		},
+	});
+	const realFetch = globalThis.fetch;
+	let upstreamCalls = 0;
+	try {
+		await t.fire("session_start");
+		const slot = JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"];
+		globalThis.fetch = (async () => {
+			upstreamCalls++;
+			return new Response("{}", { status: 200 });
+		}) as typeof fetch;
+		const response = await callProxy(slot.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${slot.apiKey}`,
+			upgrade: "websocket",
+			// `connection: upgrade` would make Node treat this as a real handshake; the header
+			// alone is enough to prove the request path refuses it.
+		});
+		assert.equal(response.status, 501);
+		assert.equal(upstreamCalls, 0);
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("the Codex slot is published with a token-shaped placeholder that carries nothing real", async () => {
+	// Pi's Codex API reads an account id out of the key before it will send anything at all
+	// (measured: "Failed to extract accountId from token" on a plain placeholder). The shape is
+	// therefore required — the content must still be worthless.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "acct-real-9",
+			},
+		},
+	});
+	try {
+		await t.fire("session_start");
+		const published = readFileSync(MODELS, "utf8");
+		const slot = JSON.parse(published).providers["openai-codex-account-2"];
+		assert.equal(slot.api, "openai-codex-responses");
+		const payload = JSON.parse(
+			Buffer.from(String(slot.apiKey).split(".")[1], "base64").toString("utf8"),
+		);
+		// The user's real account id must not be in a file a child reads — the proxy substitutes it.
+		assert.equal(payload["https://api.openai.com/auth"].chatgpt_account_id, "pi-multi-account-proxy");
+		assert.equal(published.includes("acct-real-9"), false);
+		assert.equal(published.includes("c-tok-2"), false);
+	} finally {
+		await t.fire("session_shutdown");
 		rmSync(MODELS, { force: true });
 	}
 });

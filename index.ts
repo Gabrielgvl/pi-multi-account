@@ -36,7 +36,9 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
+import { Readable } from "node:stream";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -50,6 +52,14 @@ import {
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
+import {
+	admitRequest,
+	placeholderKeyFor,
+	publishedRouteFor,
+	shapeUpstreamRequest,
+	type ProxyFamily,
+	type ProxyRoute,
+} from "./slot-proxy.ts";
 import {
 	classifyChildUsability,
 	defaultRouteWarning,
@@ -490,6 +500,12 @@ type ProviderFailoverConfig = {
 	includeOtherProviders?: boolean;
 	includeCursor?: boolean;
 	/**
+	 * Serve OAuth rotation slots to extension-free children through a parent-owned loopback
+	 * route. Off means such a child cannot use those accounts at all and silently reroutes to
+	 * whichever provider Pi finds first.
+	 */
+	childProxy?: boolean;
+	/**
 	 * When true, `/model` shows only the currently active rotation account: every other
 	 * provider is re-registered with an empty model list (its auth and OAuth config are
 	 * preserved by Pi's merge) and restored on switch or when the flag goes off.
@@ -603,6 +619,7 @@ type RuntimeConfig = Required<
 		| "includeOllama"
 		| "includeOtherProviders"
 		| "includeCursor"
+		| "childProxy"
 		| "onlyActive"
 		| "neverFailoverProviders"
 		| "providerOrder"
@@ -1543,6 +1560,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	includeOllama: true,
 	includeOtherProviders: true,
 	includeCursor: true,
+	childProxy: true,
 	neverFailoverProviders: [],
 	providerOrder: DEFAULT_PROVIDER_ORDER,
 	providerPriority: DEFAULT_PROVIDER_PRIORITY,
@@ -1699,6 +1717,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 		includeOllama: raw.includeOllama ?? true,
 		includeOtherProviders: raw.includeOtherProviders ?? true,
 		includeCursor: raw.includeCursor ?? true,
+		childProxy: raw.childProxy ?? true,
 		onlyActive: raw.onlyActive ?? false,
 		neverFailoverProviders: stringArray(raw.neverFailoverProviders),
 		providerOrder: order.filter(
@@ -7481,6 +7500,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (command === "rediscover") {
 			const changed = refreshDiscovery(true, ctx);
+			runBackground("rediscover slot proxy republish", ctx, () =>
+				publishProxiedSlots(ctx),
+			);
 			runBackground("rediscover account metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
@@ -8616,6 +8638,273 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// object at every session start: record which capabilities are present (dated, in the debug log
 	// for instant diagnosis) and, ONCE per process, tell the user in plain terms if switching is
 	// impossible or resume is degraded — instead of letting them discover it under fire.
+	// ----- parent-owned slot proxy ------------------------------------------
+	//
+	// Everything spawned without this extension loaded reads settings.json to find the active
+	// account. A numbered OAuth slot resolves by name for such a child and then fails at auth,
+	// because Pi honours an OAuth credential only for a provider definition declaring the flow —
+	// so the child silently reroutes to whichever provider Pi finds first. The Cursor slots
+	// already solve this by publishing a loopback route the parent serves with a non-secret
+	// placeholder; this extends the same pattern to the Anthropic and Codex families. Decisions
+	// live in slot-proxy.ts; what is here is the socket and the credential lookup.
+
+	let slotProxyServer: Server | undefined;
+	let slotProxyPort: number | undefined;
+	let slotProxyStarting: Promise<number | undefined> | undefined;
+	let slotProxyContext: any;
+	const slotProxyRoutes = new Map<string, ProxyRoute>();
+	/** Preferred port, so a route published last session usually still works. */
+	const SLOT_PROXY_PORT = 41977;
+
+	/** Numbered OAuth slots are the ones a child cannot otherwise authenticate to. */
+	function proxyFamilyOf(slotId: string): ProxyFamily | undefined {
+		if (!/-account-\d+$/.test(slotId)) return undefined; // base providers are Pi's own
+		const family = classifyProvider(slotId, config.qwenProvider);
+		if (family === "anthropic") return "anthropic";
+		if (family === "openai-codex") return "codex";
+		return undefined;
+	}
+
+	/** The credential to send upstream, refreshed first when the stored one has expired. */
+	async function credentialForProxy(slotId: string): Promise<AuthEntry | undefined> {
+		let entry = readAuthFile()[slotId];
+		if (!entry) return undefined;
+		if (entry.type !== "oauth" || typeof entry.access !== "string") return entry;
+		const expiry = jwtExpMs(entry.access);
+		// A minute of slack: a token that expires mid-flight fails the child's whole request, and
+		// refreshing one turn early costs nothing.
+		if (expiry !== undefined && expiry - 60_000 <= Date.now()) {
+			try {
+				await forceRefreshProvider(slotProxyContext, slotId);
+				entry = readAuthFile()[slotId] ?? entry;
+			} catch (error) {
+				logEvent("slot_proxy_refresh_failed", {
+					slot: slotId,
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return entry;
+	}
+
+	async function readRequestBody(req: any): Promise<Buffer> {
+		const chunks: Buffer[] = [];
+		for await (const chunk of req) {
+			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+		}
+		return Buffer.concat(chunks);
+	}
+
+	async function handleProxyRequest(req: any, res: any): Promise<void> {
+		// Pi's Codex API tries a WebSocket first and falls back to SSE when it cannot connect
+		// (measured: one GET, then POSTs, on a real bare child). Refusing the upgrade here makes
+		// that fallback immediate instead of spending an upstream round trip on a request that
+		// could never have been a WebSocket.
+		if (typeof req.headers?.upgrade === "string") {
+			logEvent("slot_proxy_upgrade_refused", { upgrade: req.headers.upgrade });
+			res.writeHead(501, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: { message: "this route serves HTTP only" } }));
+			return;
+		}
+		const verdict = admitRequest({
+			rawUrl: req.url ?? "",
+			headers: req.headers ?? {},
+			routes: slotProxyRoutes,
+		});
+		if (!verdict.ok) {
+			logEvent("slot_proxy_refused", { status: verdict.status, reason: verdict.message });
+			res.writeHead(verdict.status, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: { message: verdict.message } }));
+			return;
+		}
+		const credential = await credentialForProxy(verdict.route.slotId);
+		const shaped = shapeUpstreamRequest({
+			route: verdict.route,
+			rest: verdict.rest ?? "/",
+			headers: req.headers ?? {},
+			credential,
+		});
+		if (!shaped.ok) {
+			logEvent("slot_proxy_no_credential", {
+				slot: verdict.route.slotId,
+				status: shaped.status,
+			});
+			res.writeHead(shaped.status, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: { message: shaped.message } }));
+			return;
+		}
+
+		let body: Buffer | undefined =
+			req.method === "GET" || req.method === "HEAD" ? undefined : await readRequestBody(req);
+		if (body && verdict.route.family === "anthropic" && credential?.type === "oauth") {
+			// The same shaping the in-process path applies: without it Anthropic rejects a
+			// subscription token outright. Done here because the child cannot do it — it has no
+			// idea it is talking to a proxy.
+			try {
+				const parsed = JSON.parse(body.toString("utf8"));
+				const reshaped = shapeAnthropicOAuthPayload(parsed);
+				if (reshaped && reshaped !== parsed) body = Buffer.from(JSON.stringify(reshaped));
+			} catch {
+				// Not JSON, or not a messages payload — forward exactly as received.
+			}
+		}
+
+		try {
+			const upstream = await fetch(shaped.url, {
+				method: req.method ?? "POST",
+				headers: shaped.headers,
+				body: body && body.length ? new Uint8Array(body) : undefined,
+			});
+			const outgoing: Record<string, string> = {};
+			upstream.headers.forEach((value, name) => {
+				// Length and encoding are recomputed for the connection we are answering on.
+				if (name === "content-length" || name === "content-encoding") return;
+				outgoing[name] = value;
+			});
+			res.writeHead(upstream.status, outgoing);
+			if (upstream.body) {
+				await new Promise<void>((resolve) => {
+					const stream = Readable.fromWeb(upstream.body as any);
+					stream.on("error", () => resolve());
+					res.on("close", () => resolve());
+					stream.pipe(res);
+					res.on("finish", () => resolve());
+				});
+			} else {
+				res.end();
+			}
+			logEvent("slot_proxy_forwarded", {
+				slot: verdict.route.slotId,
+				status: upstream.status,
+			});
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			logEvent("slot_proxy_upstream_failed", { slot: verdict.route.slotId, reason });
+			if (!res.headersSent) {
+				res.writeHead(502, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { message: `upstream request failed: ${reason}` } }));
+			} else {
+				res.end();
+			}
+		}
+	}
+
+	/** Start the loopback listener once, preferring a stable port so published routes survive. */
+	function startSlotProxy(): Promise<number | undefined> {
+		if (slotProxyPort !== undefined) return Promise.resolve(slotProxyPort);
+		if (slotProxyStarting) return slotProxyStarting;
+		slotProxyStarting = new Promise<number | undefined>((resolve) => {
+			const server = createServer((req, res) => {
+				handleProxyRequest(req, res).catch((error) => {
+					logEvent("slot_proxy_handler_failed", {
+						reason: error instanceof Error ? error.message : String(error),
+					});
+					try {
+						if (!res.headersSent) res.writeHead(500);
+						res.end();
+					} catch {
+						/* the socket is already gone */
+					}
+				});
+			});
+			// A WebSocket handshake that got past the request handler is closed at the socket, so
+			// nothing is left half-open waiting for an upgrade this proxy will never perform.
+			server.on("upgrade", (_req: any, socket: any) => {
+				try {
+					socket.destroy();
+				} catch {
+					/* already gone */
+				}
+			});
+			// A dead listener must never take Pi down with it — the same rule the Cursor bridge
+			// learned the hard way.
+			server.on("error", (error: NodeJS.ErrnoException) => {
+				if (error.code === "EADDRINUSE" && server.listening === false && !slotProxyPort) {
+					// Another Pi process already holds the preferred port. Take any free one and
+					// republish; both processes hold the same credentials, so either serves.
+					server.listen(0, "127.0.0.1");
+					return;
+				}
+				logEvent("slot_proxy_listen_failed", { reason: error.message });
+				resolve(undefined);
+			});
+			server.listen(SLOT_PROXY_PORT, "127.0.0.1", () => {
+				const address = server.address();
+				slotProxyPort = typeof address === "object" && address ? address.port : undefined;
+				slotProxyServer = server;
+				server.unref(); // never hold Pi open on our account
+				logEvent("slot_proxy_listening", { port: slotProxyPort });
+				resolve(slotProxyPort);
+			});
+		}).finally(() => {
+			slotProxyStarting = undefined;
+		});
+		return slotProxyStarting;
+	}
+
+	function stopSlotProxy() {
+		try {
+			slotProxyServer?.close();
+		} catch {
+			/* closing a server that never opened is not a problem */
+		}
+		slotProxyServer = undefined;
+		slotProxyPort = undefined;
+		slotProxyRoutes.clear();
+	}
+
+	/**
+	 * Publish every numbered OAuth slot against the running proxy, so a child resolves the slot
+	 * AND can authenticate to it. Without the second half the first is a trap.
+	 */
+	async function publishProxiedSlots(ctx: any): Promise<void> {
+		if (!config.childProxy) return;
+		slotProxyContext = ctx ?? slotProxyContext;
+		const auth = readAuthFile();
+		const slots = [...registeredSlots].filter(
+			(id) => proxyFamilyOf(id) !== undefined && isEntryUsable(auth[id]),
+		);
+		if (slots.length === 0) return;
+		const port = await startSlotProxy();
+		if (port === undefined) return;
+		for (const id of slots) {
+			const family = proxyFamilyOf(id);
+			if (!family) continue;
+			slotProxyRoutes.set(id, { slotId: id, family });
+			const baseUrl = publishedRouteFor(port, id);
+			if (family === "anthropic") {
+				provisionNativeSlot(id, {
+					api: "anthropic-messages",
+					baseUrl,
+					apiKey: placeholderKeyFor(family),
+					models: DEFAULT_ANTHROPIC_MODELS.map((modelId) => ({
+						...anthropicModelDef(modelId, id),
+						baseUrl,
+					})),
+				});
+			} else {
+				const cached = codexModelCatalogByProvider.get(id)?.models as
+					| Array<Record<string, unknown>>
+					| undefined;
+				const models = (cached?.length ? cached : DEFAULT_CODEX_MODELS.map(codexModelDef)) as Array<
+					Record<string, unknown>
+				>;
+				// Published as Codex's own API on purpose: Pi then shapes the body the way that
+				// backend requires (`store: false`, the instructions field, its own headers), which
+				// a generic `openai-responses` slot would not. The cost is that Pi insists on
+				// reading an account id out of the key, which is why that family's placeholder is
+				// JWT-shaped.
+				provisionNativeSlot(id, {
+					api: "openai-codex-responses",
+					baseUrl,
+					apiKey: placeholderKeyFor(family),
+					models,
+				});
+			}
+		}
+		logEvent("slot_proxy_published", { port, slots });
+	}
+
 	function preflightHostCapabilities(ctx: any) {
 		const has = (name: string) =>
 			typeof (pi as unknown as Record<string, unknown>)[name] === "function";
@@ -8677,6 +8966,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// published them rather than the version our own slot provisioning has just rewritten.
 		checkPiContract(ctx, "session_start");
 		refreshDiscovery(true, ctx);
+		slotProxyContext = ctx;
+		// Publish the OAuth slots against a route this process serves, so anything spawned
+		// without this extension can actually run on the account the rotation chose.
+		await publishProxiedSlots(ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		applyOnlyActiveFilter(ctx);
@@ -8747,6 +9040,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		clearPendingContinuation();
 		clearUsageStatusTimer();
 		endResumeWatch();
+		// The published routes point at this process; nothing must be left listening after it.
+		stopSlotProxy();
 		watchdogAborting = false;
 		expectingInjectedContinuation = false;
 		userAbortedChain = false;
