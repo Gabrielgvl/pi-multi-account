@@ -50,6 +50,16 @@ import {
 	setupCursorSubscription,
 } from "./cursor-bridge.ts";
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
+import {
+	DEFAULT_CONTEXT_GUARD_SETTINGS,
+	createOverheadTracker,
+	decideGuard,
+	estimateRawTokens,
+	planElision,
+	type ContextGuardSettings,
+	type GuardMessage,
+	type OverheadTracker,
+} from "./context-guard.ts";
 
 // ---------------------------------------------------------------------------
 // pi-ai OAuth bridge (version-agnostic)
@@ -504,6 +514,12 @@ type ProviderFailoverConfig = {
 	// drops the interrupted assistant message entirely before the next request is built,
 	// so the continuation lands on an account that cannot see the work it is told not to
 	// repeat. Default: true.
+	// Keep a request inside the model's context window WHILE the agent is working. Pi only checks
+	// whether to compact after a whole agent run has ended and before a new user prompt, so a long
+	// autonomous run is never measured: one run in the dialer session on 2026-08-20 grew from 85 663
+	// to 542 529 tokens against a 272 000 window with no check at all. `true`/absent uses the
+	// defaults; an object overrides individual thresholds; `false` disables the guard entirely.
+	contextGuard?: boolean | Partial<ContextGuardSettings>;
 	preserveInterruptedContext?: boolean;
 	// When the active account is rate-limited/cooling/invalid and Pi needs to compact
 	// (context overflow or threshold), run the summary on a HEALTHY fallback account
@@ -585,6 +601,7 @@ type RuntimeConfig = Required<
 > & {
 	openaiCodexAliases: OpenAICodexAliasConfig[];
 	anthropicOAuthAliases: AnthropicOAuthAliasConfig[];
+	contextGuard: ContextGuardSettings;
 };
 
 type SwitchRecord = {
@@ -1412,6 +1429,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	ignoreErrorPatterns: DEFAULT_IGNORE_PATTERNS,
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
+	contextGuard: true,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
 	autoRecoverStuck: true,
@@ -1442,6 +1460,42 @@ function positiveOr(value: unknown, fallback: number) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0
 		? value
 		: fallback;
+}
+
+/**
+ * Resolve the context-guard settings. `true`/absent takes the defaults, `false` turns the guard
+ * off, an object overrides individual thresholds. Every number is sanity-checked here rather than
+ * trusted, because a mistyped percentage would either trim on every request or never at all.
+ */
+function normalizeContextGuard(value: unknown): ContextGuardSettings {
+	const defaults = DEFAULT_CONTEXT_GUARD_SETTINGS;
+	if (value === false) return { ...defaults, enabled: false };
+	if (value === true || value === undefined || value === null) return { ...defaults };
+	if (typeof value !== "object") return { ...defaults };
+	const raw = value as Partial<ContextGuardSettings>;
+	const share = (candidate: unknown, fallback: number) =>
+		typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0 && candidate <= 1
+			? candidate
+			: fallback;
+	const settings: ContextGuardSettings = {
+		enabled: raw.enabled ?? true,
+		softPercent: share(raw.softPercent, defaults.softPercent),
+		targetPercent: share(raw.targetPercent, defaults.targetPercent),
+		compactPercent: share(raw.compactPercent, defaults.compactPercent),
+		keepVerbatimTokens: positiveOr(raw.keepVerbatimTokens, defaults.keepVerbatimTokens),
+		minElideTokens: positiveOr(raw.minElideTokens, defaults.minElideTokens),
+		maxWindowTokens:
+			typeof raw.maxWindowTokens === "number" &&
+			Number.isFinite(raw.maxWindowTokens) &&
+			raw.maxWindowTokens >= 0
+				? raw.maxWindowTokens
+				: defaults.maxWindowTokens,
+	};
+	// Trimming down to a point at or above where trimming starts would loop; keep them ordered.
+	if (settings.targetPercent >= settings.softPercent) {
+		settings.targetPercent = Math.max(0.1, settings.softPercent - 0.15);
+	}
+	return settings;
 }
 
 function stringArray(value: unknown): string[] {
@@ -1572,6 +1626,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			raw.maxRecheckIntervalMs,
 			MAX_RECHECK_INTERVAL_MS,
 		),
+		contextGuard: normalizeContextGuard(raw.contextGuard),
 		preserveInterruptedContext: raw.preserveInterruptedContext ?? true,
 		routeCompactionToHealthyAccount:
 			raw.routeCompactionToHealthyAccount ?? true,
@@ -7874,6 +7929,186 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			folded: rescued,
 		});
 		return { messages: preserved };
+	});
+
+	// ---- mid-run context guard --------------------------------------------
+	// Pi measures the context in exactly two places: after a whole agent run has ended, and just
+	// before a new user prompt. Inside a run — which is where an autonomous session spends almost
+	// all of its time — nothing measures anything. Worse, a retryable provider error takes the
+	// retry branch of _handlePostAgentRun() and returns BEFORE the compaction check, so the one
+	// checkpoint that exists is routinely spent on a retry.
+	//
+	// Measured in this user's transcripts: one agent run (dialer, 2026-08-20, 13:37→14:56) grew
+	// from 85 663 to 542 529 tokens against a 272 000 window without a single check; across the
+	// corpus 30 % of all requests on gpt-5.6-sol went out above 100 % of the advertised window.
+	//
+	// So the guard measures every outgoing request itself and, above the soft line, elides the
+	// oldest tool results out of THAT REQUEST ONLY — the session transcript is never touched. Real
+	// compaction is requested separately and only at a settled boundary, because ctx.compact()
+	// begins with an abort() and mid-run would kill the agent's work.
+	//
+	// It deliberately does not trust the provider's reported prompt size: Cursor answers from its
+	// own checkpointed conversation and openai-codex continues one server-side via WebSocket
+	// deltas and `previous_response_id`, so both report their bookkeeping rather than the request
+	// we built. See context-guard.ts for the accounting and the evidence behind each threshold.
+	const contextGuardTrackers = new Map<string, OverheadTracker>();
+	const contextGuardElided = new Set<string>();
+	let contextGuardLastRaw = 0;
+	let contextGuardTrimmedLastRequest = false;
+	let contextGuardWantsCompaction = false;
+	let contextGuardCompactionInFlight = false;
+	let contextGuardLastCompactionAt = 0;
+	let contextGuardNotifiedThisRun = false;
+
+	/** Minimum spacing between two guard-driven compactions, so a session cannot loop on them. */
+	const CONTEXT_GUARD_COMPACTION_COOLDOWN_MS = 120_000;
+
+	function contextGuardTracker(ctx: any): OverheadTracker {
+		const key = `${ctx?.model?.provider ?? "?"}/${ctx?.model?.id ?? "?"}`;
+		let tracker = contextGuardTrackers.get(key);
+		if (!tracker) {
+			tracker = createOverheadTracker();
+			contextGuardTrackers.set(key, tracker);
+		}
+		return tracker;
+	}
+
+	function contextGuardActive(): boolean {
+		return config.enabled && config.contextGuard.enabled;
+	}
+
+	safeOn("context", (event: any, ctx: any) => {
+		if (!contextGuardActive()) return undefined;
+		const settings = config.contextGuard;
+		const messages = event?.messages;
+		if (!Array.isArray(messages) || messages.length === 0) return undefined;
+
+		let systemPrompt = "";
+		try {
+			systemPrompt = ctx?.getSystemPrompt?.() ?? "";
+		} catch {
+			systemPrompt = ""; // a provider-less context still deserves a measurement
+		}
+		const raw = estimateRawTokens(messages as GuardMessage[], systemPrompt);
+		const tracker = contextGuardTracker(ctx);
+		const decision = decideGuard(
+			tracker.adjust(raw),
+			Number(ctx?.model?.contextWindow ?? 0),
+			settings,
+		);
+		contextGuardLastRaw = raw;
+		contextGuardTrimmedLastRequest = false;
+		if (decision.window <= 0) return undefined; // unknown window ⇒ no basis to act
+		if (decision.wantCompaction) contextGuardWantsCompaction = true;
+		// Below the soft line there is still work to do once anything has been elided: re-apply it,
+		// or the request prefix flips back and forth and the prompt cache is thrown away each turn.
+		if (!decision.trim && contextGuardElided.size === 0) return undefined;
+
+		const plan = planElision(messages as GuardMessage[], contextGuardElided, {
+			targetTokens: decision.trim ? decision.targetTokens : Number.POSITIVE_INFINITY,
+			keepVerbatimTokens: settings.keepVerbatimTokens,
+			minElideTokens: settings.minElideTokens,
+		});
+		if (!plan.changed) return undefined;
+		contextGuardTrimmedLastRequest = true;
+		if (plan.elidedNow > 0) {
+			logEvent("context_guard_trimmed", {
+				model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
+				window: decision.window,
+				percentBefore: Math.round(decision.percent * 100),
+				rawTokens: raw,
+				overhead: tracker.overhead(),
+				elidedNow: plan.elidedNow,
+				elidedTotal: plan.elidedTotal,
+				freedTokens: plan.freedTokens,
+				tokensAfter: plan.tokensAfter,
+			});
+			if (!contextGuardNotifiedThisRun) {
+				contextGuardNotifiedThisRun = true;
+				try {
+					ctx?.ui?.notify?.(
+						`pi-multi-account: context reached ${Math.round(decision.percent * 100)}% of the ` +
+							`${decision.window.toLocaleString("en-US")}-token window mid-run; older tool output is ` +
+							`being left out of requests and a summary is queued. Nothing was removed from the transcript.`,
+						"info",
+					);
+				} catch {
+					/* a notification must never break the request */
+				}
+			}
+		}
+		return { messages: plan.messages };
+	});
+
+	// Learn how far the provider's real prompt count sits above our estimate — but only from a
+	// request we left alone, and only when the number is plausible. An implausible one is the
+	// provider reporting its own copy of the conversation, and learning from it would wedge the
+	// guard's accounting for the rest of the session.
+	safeOn("message_end", (event: any, ctx: any) => {
+		if (!contextGuardActive()) return undefined;
+		if (contextGuardTrimmedLastRequest) return undefined;
+		const usage = event?.message?.usage;
+		if (!usage || contextGuardLastRaw <= 0) return undefined;
+		const reported =
+			Number(usage.input ?? 0) + Number(usage.cacheRead ?? 0) + Number(usage.cacheWrite ?? 0);
+		if (!(reported > 0)) return undefined;
+		contextGuardTracker(ctx).observe(contextGuardLastRaw, reported);
+		return undefined;
+	});
+
+	safeOn("agent_start", () => {
+		contextGuardNotifiedThisRun = false;
+		return undefined;
+	});
+
+	// The only safe place to run a real compaction: the agent has settled, nothing is streaming,
+	// and no continuation is waiting to be dispatched (compact() aborts, and aborting a queued
+	// continuation would strand the work the failover logic just rescued).
+	safeOn("agent_settled", (_event: any, ctx: any) => {
+		if (!contextGuardActive()) return undefined;
+		if (!contextGuardWantsCompaction || contextGuardCompactionInFlight) return undefined;
+		if (Date.now() - contextGuardLastCompactionAt < CONTEXT_GUARD_COMPACTION_COOLDOWN_MS)
+			return undefined;
+		if (!ctx?.isIdle?.()) return undefined;
+		if (ctx?.hasPendingMessages?.()) return undefined;
+		if (hasPendingResume()) return undefined;
+		contextGuardCompactionInFlight = true;
+		contextGuardLastCompactionAt = Date.now();
+		logEvent("context_guard_compaction_requested", {
+			model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
+			elided: contextGuardElided.size,
+		});
+		try {
+			ctx.compact({
+				onComplete: () => {
+					contextGuardCompactionInFlight = false;
+				},
+				onError: (error: Error) => {
+					contextGuardCompactionInFlight = false;
+					// "Nothing to compact" is a normal answer, not a fault: stop asking until the
+					// context grows again rather than retrying every settle.
+					contextGuardWantsCompaction = false;
+					logEvent("context_guard_compaction_failed", {
+						error: String(error?.message ?? error),
+					});
+				},
+			});
+		} catch (error) {
+			contextGuardCompactionInFlight = false;
+			logEvent("context_guard_compaction_failed", { error: String(error) });
+		}
+		return undefined;
+	});
+
+	// A compaction happened (ours, Pi's, or the user's /compact): the message list is rebuilt, so
+	// every elision key now points at history that is no longer in the request. Start clean.
+	safeOn("session_compact", () => {
+		contextGuardElided.clear();
+		contextGuardWantsCompaction = false;
+		contextGuardCompactionInFlight = false;
+		contextGuardLastRaw = 0;
+		contextGuardTrimmedLastRequest = false;
+		return undefined;
 	});
 
 	safeOn("before_provider_request", (event: any, ctx?: any) => {

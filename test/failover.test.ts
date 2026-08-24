@@ -263,6 +263,7 @@ function setup(opts: {
 		setModels: [] as string[],
 		notifies: [] as string[],
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
+		compacts: [] as Array<Record<string, unknown>>,
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
 		registrations: [] as Array<{ provider: string; models: number | undefined }>,
@@ -291,7 +292,11 @@ function setup(opts: {
 			: level;
 	};
 	let idle = opts.idle ?? true;
-	const events: Record<string, (event: any, ctx?: any) => any> = {};
+	// Pi runs EVERY handler registered for an event, threading the result through for `context`
+	// and `message_end`. Keeping only the last one registered (which this fixture used to do) made
+	// the harness silently disagree with the host the moment a second handler was added for an
+	// event — the interrupted-turn hook stopped being exercised at all. Chain them, like Pi does.
+	const events: Record<string, Array<(event: any, ctx?: any) => any>> = {};
 	const busEvents = new Map<string, Array<(payload: any) => void>>();
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
 
@@ -300,6 +305,12 @@ function setup(opts: {
 			? mkModel(opts.current.provider, opts.current.id)
 			: undefined,
 		isIdle: () => idle,
+		// The host's ctx.compact(): fire-and-forget, resolves through the callbacks. The guard calls
+		// this only at a settled boundary, because the real one begins with an abort().
+		compact: (options?: { onComplete?: (r: unknown) => void; onError?: (e: Error) => void }) => {
+			rec.compacts.push(options ?? {});
+			queueMicrotask(() => options?.onComplete?.({ summary: "test summary" }));
+		},
 		signal: { aborted: opts.aborted ?? false },
 		hasPendingMessages: () => false,
 		abort: () => {
@@ -426,7 +437,7 @@ function setup(opts: {
 			commands[name] = options.handler;
 		},
 		on: (event: string, handler: any) => {
-			events[event] = handler;
+			(events[event] ??= []).push(handler);
 		},
 		setModel: async (model: any) => {
 			const previousModel = ctx.model;
@@ -436,10 +447,8 @@ function setup(opts: {
 			ctx.model = mkModel(model.provider, model.id);
 			// Pi re-clamps (and persists) the thinking level for the new model's capabilities.
 			sessionThinkingLevel = clampThinking(sessionThinkingLevel);
-			await events.model_select?.(
-				{ model: ctx.model, previousModel, source: "set" },
-				ctx,
-			);
+			for (const handler of events.model_select ?? [])
+				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
 			return true;
 		},
 		sendUserMessage: (prompt: string, options?: Record<string, unknown>) =>
@@ -468,8 +477,43 @@ function setup(opts: {
 
 	piMultiAccount(pi);
 
-	const fire = async (event: string, payload: any = {}) =>
-		events[event]?.(payload, ctx);
+	const fire = async (event: string, payload: any = {}) => {
+		const handlers = events[event];
+		if (!handlers || handlers.length === 0) return undefined;
+		if (event === "context") {
+			let messages = payload?.messages;
+			let changed = false;
+			for (const handler of handlers) {
+				const out = await handler({ ...payload, messages }, ctx);
+				if (out?.messages) {
+					messages = out.messages;
+					changed = true;
+				}
+			}
+			return changed ? { messages } : undefined;
+		}
+		if (event === "message_end") {
+			let message = payload?.message;
+			let changed = false;
+			for (const handler of handlers) {
+				const out = await handler({ ...payload, message }, ctx);
+				if (out?.message) {
+					message = out.message;
+					changed = true;
+				}
+			}
+			return changed ? { message } : undefined;
+		}
+		let result: any;
+		for (const handler of handlers) {
+			const out = await handler(payload, ctx);
+			if (out !== undefined) {
+				result = out;
+				if (out?.cancel) return out;
+			}
+		}
+		return result;
+	};
 	const setIdle = (value: boolean) => {
 		idle = value;
 	};
@@ -483,12 +527,20 @@ function setup(opts: {
 			return {};
 		}
 	};
-	const beforeReq = (payload: unknown) =>
-		events.before_provider_request?.({ payload }, ctx);
+	// Stays synchronous on purpose: the host shapes the payload inline, and the tests read the
+	// shaped result straight back rather than awaiting it.
+	const beforeReq = (payload: unknown) => {
+		let result: any;
+		for (const handler of events.before_provider_request ?? []) {
+			const out = handler({ payload }, ctx);
+			if (out !== undefined) result = out;
+		}
+		return result;
+	};
 	const command = async (args: string) =>
 		commands["multi-account"]?.(args, ctx);
 	const input = async (text: string, images?: any[]) =>
-		events.input?.({ type: "input", text, images, source: "interactive" }, ctx);
+		fire("input", { type: "input", text, images, source: "interactive" });
 
 	// The level the session is actually running at, and the user changing it via `/thinking`.
 	const thinkingLevel = () => sessionThinkingLevel;
@@ -7150,4 +7202,114 @@ test("the published placeholder is the one the vendored proxy actually accepts",
 		/token === "cursor-proxy"/,
 		"the vendored proxy must still recognise the placeholder we publish",
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Mid-run context guard — wiring
+//
+// context-guard.test.ts proves the accounting and the elision. These prove the extension
+// actually reaches them: the guard has to fire from inside the `context` hook (the only hook Pi
+// runs before EVERY LLM call, including the hundreds inside one autonomous run) and it has to ask
+// for a real summary only once the agent has settled.
+// ---------------------------------------------------------------------------
+
+/** A conversation shaped like the real 2026-08-20 run: mostly large tool results. */
+function bigConversation(turns: number) {
+	const messages: any[] = [
+		{ role: "user", content: [{ type: "text", text: "продовжуй" }], timestamp: 1 },
+	];
+	for (let i = 0; i < turns; i++) {
+		messages.push({
+			role: "assistant",
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			stopReason: "toolUse",
+			timestamp: 1000 + i,
+			content: [{ type: "toolCall", id: `call-${i}`, name: "read", arguments: { path: `f${i}.ts` } }],
+		});
+		messages.push({
+			role: "toolResult",
+			toolCallId: `call-${i}`,
+			toolName: "read",
+			isError: false,
+			timestamp: 2000 + i,
+			content: [{ type: "text", text: "x".repeat(20_000) }], // 5 000 tokens each
+		});
+	}
+	return messages;
+}
+
+test("the context guard trims a mid-run request instead of letting it overflow", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
+
+	// ~250 000 tokens of tool results: past the soft line, and the point at which Pi itself would
+	// still be doing nothing at all because the run has not ended.
+	const messages = bigConversation(50);
+	const result = await t.fire("context", { messages });
+
+	assert.ok(result?.messages, "the guard must rewrite the outgoing request");
+	assert.equal(result.messages.length, messages.length, "no message may be dropped");
+	const stubbed = result.messages.filter(
+		(m: any) =>
+			m.role === "toolResult" && String(m.content?.[0]?.text ?? "").includes("context-guard"),
+	);
+	assert.ok(stubbed.length > 0, "old tool output must be left out of the request");
+	// The tail the agent is actively working in stays verbatim.
+	const last = result.messages[result.messages.length - 1];
+	assert.equal(String(last.content[0].text).includes("context-guard"), false);
+	// And the transcript Pi holds is untouched — we only shape what goes over the wire.
+	assert.equal(messages[2].content[0].text.length, 20_000);
+});
+
+test("the context guard asks for a real summary only once the agent has settled", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	// Mid-run: nothing may call compact(), because the real one starts with an abort() and would
+	// throw away the work the agent is in the middle of.
+	t.setIdle(false);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 0, "compaction must never be triggered mid-run");
+
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1, "a settled boundary is where the summary belongs");
+
+	// A compaction rebuilds the message list, so every elision key now points at history that is
+	// no longer in the request. If the guard kept them, the next small request would come back
+	// stubbed for no reason — and the prompt cache would be thrown away with it.
+	await t.fire("session_compact", {});
+	// 20 turns: comfortably under the soft line, but long enough that part of it sits outside the
+	// protected tail — so a stale elision key would visibly stub it.
+	const afterCompaction = await t.fire("context", { messages: bigConversation(20) });
+	assert.equal(afterCompaction, undefined, "stale elisions must not survive a summary");
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1, "and it must not immediately ask again");
+});
+
+test("the context guard stands down when the model's window is unknown", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	// mkModel deliberately has no contextWindow: with no window there is no basis for a decision.
+	const messages = bigConversation(50);
+	const result = await t.fire("context", { messages });
+	assert.equal(result, undefined, "no window ⇒ no opinion, never a guess");
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 0);
+});
+
+test("the context guard leaves an ordinary conversation completely alone", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "s".repeat(24_000);
+	const result = await t.fire("context", { messages: bigConversation(2) });
+	assert.equal(result, undefined);
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 0);
 });
