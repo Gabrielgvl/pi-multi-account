@@ -7731,3 +7731,126 @@ test("/multi-account priority distinguishes reset from clear", async () => {
 		"ollama",
 	]);
 });
+
+// ---------------------------------------------------------------------------
+// Pi's published files: the contract this extension actually depends on
+//
+// Two Pi changes have broken this extension without announcing themselves, because neither
+// auth.json nor models.json carries a schema version. These lock the detection: the extension
+// looks at the files, and says so when one stops matching.
+// ---------------------------------------------------------------------------
+
+const contractWarning = (t: ReturnType<typeof setup>) =>
+	t.rec.notifies.find((message) => message.includes("no longer matches what this extension"));
+
+test("a healthy install says nothing about the file contract", async () => {
+	rmSync(MODELS, { force: true });
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.fire("session_start");
+	assert.equal(contractWarning(t), undefined, `notifies=${t.rec.notifies.join(" | ")}`);
+	await t.fire("session_shutdown");
+});
+
+test("a models.json written with bare model ids is reported at session start", async () => {
+	// The real incident: bare strings where Pi requires objects made Pi reject the WHOLE file, so
+	// every custom provider the user had vanished at once, silently.
+	writeFileSync(
+		MODELS,
+		JSON.stringify({
+			// A third-party provider on purpose: our own slots get rewritten by provisioning, and
+			// the point of the check is the file as the USER left it.
+			providers: { "my-local-thing": { api: "openai-completions", models: ["k3"] } },
+		}),
+	);
+	try {
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+		await t.fire("session_start");
+		const warning = contractWarning(t);
+		assert.ok(warning, `expected a contract warning; notifies=${t.rec.notifies.join(" | ")}`);
+		assert.match(warning, /models\.json/);
+		assert.match(warning, /bare string/);
+		// Blast radius, or it reads like a problem confined to one slot.
+		assert.match(warning, /ENTIRE file/);
+		await t.fire("session_shutdown");
+	} finally {
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a corrupt published file is reported rather than silently ignored", async () => {
+	writeFileSync(MODELS, "{ this is not json");
+	try {
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+		await t.fire("session_start");
+		const warning = contractWarning(t);
+		assert.ok(warning, `notifies=${t.rec.notifies.join(" | ")}`);
+		assert.match(warning, /will not parse/);
+		await t.fire("session_shutdown");
+	} finally {
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("settings.json is NOT judged before a switch has happened", async () => {
+	// At session start the file legitimately still names the previous session's choice. Warning
+	// about that would be noise on every single startup.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		settings: { defaultProvider: "openai-codex-account-2", defaultModel: "gpt-5.5" },
+	});
+	await t.fire("session_start");
+	assert.equal(contractWarning(t), undefined, `notifies=${t.rec.notifies.join(" | ")}`);
+	await t.fire("session_shutdown");
+});
+
+test("after a switch, settings.json failing to name the live model is called out", async () => {
+	// This is the live failure that started all of this: the rotation was on Codex, settings.json
+	// said Anthropic, and a bare `--no-extensions` child ran on Anthropic and was billing-refused.
+	// Nothing in Pi promises those keys are maintained, so the only defence is to look.
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		settings: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-8" },
+		config: { debugLog: true },
+	});
+	await t.fire("session_start");
+	assert.equal(contractWarning(t), undefined, "nothing to judge yet");
+
+	// The session moves to another account and Pi does NOT rewrite settings.json — the exact
+	// failure being guarded against.
+	t.setCurrent("openai-codex-account-2", "gpt-5.5");
+	await t.fire("model_select", { model: { provider: "openai-codex-account-2", id: "gpt-5.5" } });
+	await t.fire("agent_start");
+
+	const warning = contractWarning(t);
+	assert.ok(warning, `expected a stale-default warning; notifies=${t.rec.notifies.join(" | ")}`);
+	assert.match(warning, /anthropic\/claude-opus-4-8/);
+	assert.match(warning, /openai-codex-account-2\/gpt-5\.5/);
+	// The consequence is the whole reason this matters — a child, not a cosmetic file.
+	assert.match(warning, /child/);
+
+	const logged = readDebugLog().filter((entry) => entry.kind === "pi_contract_checked");
+	assert.ok(logged.length > 0, "the black box must record the check");
+	assert.ok(
+		logged.at(-1)?.unpromised?.includes("settings-default-model-autowritten"),
+		"the log must name the unpromised assumption this check exists for",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("after a switch, settings.json naming the live model is silent", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		settings: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-8" },
+	});
+	await t.fire("session_start");
+	// Pi did its job: the file follows the switch.
+	t.setCurrent("openai-codex-account-2", "gpt-5.5");
+	writeFileSync(
+		SETTINGS,
+		JSON.stringify({ defaultProvider: "openai-codex-account-2", defaultModel: "gpt-5.5" }),
+	);
+	await t.fire("model_select", { model: { provider: "openai-codex-account-2", id: "gpt-5.5" } });
+	await t.fire("agent_start");
+	assert.equal(contractWarning(t), undefined, `notifies=${t.rec.notifies.join(" | ")}`);
+	await t.fire("session_shutdown");
+});

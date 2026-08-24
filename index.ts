@@ -51,6 +51,14 @@ import {
 } from "./cursor-bridge.ts";
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
 import {
+	checkAuthShape,
+	checkModelsShape,
+	checkSettingsTracksActive,
+	describeContractDrift,
+	observedAssumptions,
+	type ShapeVerdict,
+} from "./pi-contract.ts";
+import {
 	DEFAULT_PROVIDER_PRIORITY,
 	comparePriority,
 	describePriority,
@@ -713,6 +721,68 @@ function readHostDefaultModel(): { provider: string; id: string } | undefined {
 		/* settings.json is optional */
 	}
 	return undefined;
+}
+
+/**
+ * The three files Pi publishes, read the only way this extension is allowed to read them: parse,
+ * never write, and treat absence as normal rather than as a fault.
+ *
+ * `undefined` means "no such file" — a fresh install has no models.json and no custom providers,
+ * and reporting that as drift would be pure noise. A file that exists but will not parse is a
+ * different thing entirely and is reported, because a corrupt models.json is exactly how every
+ * custom provider a user has disappears at once.
+ */
+function readPublishedJson(path: string): { present: boolean; value?: unknown; unreadable?: string } {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch {
+		return { present: false };
+	}
+	try {
+		return { present: true, value: JSON.parse(text) };
+	} catch (error) {
+		return {
+			present: true,
+			unreadable: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+/**
+ * Check the published files against the shapes this extension depends on.
+ *
+ * `active` is supplied only once a model switch has happened in the session: before that,
+ * settings.json legitimately still names the previous session's choice, and checking it would
+ * report a mismatch that means nothing.
+ */
+function inspectPiContract(active?: { provider: string; id: string }): ShapeVerdict[] {
+	const verdicts: ShapeVerdict[] = [];
+	const checks: Array<[string, string, (raw: unknown) => ShapeVerdict]> = [
+		["auth.json", AUTH_PATH, checkAuthShape],
+		["models.json", MODELS_CONFIG_PATH, checkModelsShape],
+	];
+	if (active) {
+		checks.push([
+			"settings.json",
+			SETTINGS_PATH,
+			(raw) => checkSettingsTracksActive(raw, active),
+		]);
+	}
+	for (const [file, path, check] of checks) {
+		const read = readPublishedJson(path);
+		if (!read.present) continue;
+		if (read.unreadable) {
+			verdicts.push({
+				file,
+				ok: false,
+				problems: [`exists but will not parse (${read.unreadable})`],
+			});
+			continue;
+		}
+		verdicts.push(check(read.value));
+	}
+	return verdicts;
 }
 
 type NativeModelEntry = {
@@ -3332,6 +3402,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx: any,
 	) {
 		if (onlyActiveModels) unhideProvider(target.provider);
+		// Pi rewrites settings.json on this path; the next turn checks that it actually did.
+		pendingSettingsCheck = true;
 		return pi.setModel(target as any);
 	}
 
@@ -3544,6 +3616,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let stuckReminders = 0;
 	// True only while WE deliberately abort a wedged resumed turn, so agent_end can tell our
 	// recovery abort apart from a real user Esc and auto-continue instead of stopping.
+	/**
+	 * Set on every model switch, cleared once the next turn has verified it.
+	 *
+	 * Before the first switch, settings.json still names the previous session's choice, so
+	 * comparing it to the live model would report a mismatch that means nothing. After a switch
+	 * the comparison is meaningful: Pi is supposed to have rewritten both keys, and everything
+	 * spawned without this extension loaded reads them to find the active account.
+	 */
+	let pendingSettingsCheck = false;
+	/** Contract drift is stated once per session — it is a standing condition, not an event. */
+	let contractDriftAnnounced = false;
+	/** Last contract verdicts, for the status line. */
+	let lastContractVerdicts: ShapeVerdict[] = [];
+
 	let watchdogAborting = false;
 	// How many tools are executing right now on the resumed turn. A long build/test command is
 	// silent for minutes but is NOT stuck — never abort while a tool is in flight.
@@ -3680,6 +3766,47 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// return value (Pi uses these — e.g. the shaped payload, the input action, the
 	// compaction result); on a sync throw OR async rejection it reports once and
 	// returns undefined, which every Pi event treats as "no opinion / default".
+	/**
+	 * Look at the files Pi publishes, and say something only when one no longer has the shape this
+	 * extension depends on.
+	 *
+	 * Neither auth.json nor models.json carries a schema version, so a Pi upgrade can change
+	 * either without anything announcing it — both breakages this extension has already lived
+	 * through were silent for days. Looking is the only detection available.
+	 *
+	 * `includeSettings` is true only on the turn after a model switch, when settings.json is
+	 * supposed to have been rewritten to name the account the rotation just chose.
+	 */
+	function checkPiContract(ctx: any, why: string, includeSettings = false) {
+		const active =
+			includeSettings && ctx?.model?.provider && ctx?.model?.id
+				? { provider: ctx.model.provider as string, id: ctx.model.id as string }
+				: undefined;
+		const verdicts = inspectPiContract(active);
+		lastContractVerdicts = verdicts;
+		const drift = describeContractDrift(verdicts);
+		// A healthy check is logged once, at session start; after that only faults are worth a
+		// line, or the black box fills with "still fine" on every turn.
+		if (drift || why === "session_start") {
+			logEvent("pi_contract_checked", {
+				why,
+				checked: verdicts.map((verdict) => verdict.file),
+				problems: verdicts.flatMap((verdict) => verdict.problems),
+				// Named on every logged check: after an upgrade these are the rows to re-verify by
+				// hand, because nothing in Pi promises them.
+				unpromised: observedAssumptions().map((assumption) => assumption.id),
+			});
+		}
+		if (!drift) {
+			// Cleared, so a fault that comes back later is announced again rather than swallowed.
+			contractDriftAnnounced = false;
+			return;
+		}
+		if (contractDriftAnnounced) return;
+		contractDriftAnnounced = true;
+		ctx?.ui?.notify?.(drift, "warning");
+	}
+
 	function safeOn(event: string, handler: (ev: any, ctx: any) => any) {
 		pi.on(event as any, (ev: any, ctx: any) => {
 			try {
@@ -7949,6 +8076,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
 				`Debug log: ${config.debugLog ? `on → ${DEBUG_LOG_PATH} (/multi-account log to view)` : "off"}`,
 				`Config: ${CONFIG_PATH}`,
+				// Pi publishes three files and versions none of the formats, so a silent upgrade is
+				// the failure mode. Stating the last look at them here is what makes it checkable.
+				`Pi file contract: ${
+					lastContractVerdicts.length === 0
+						? "not checked yet"
+						: lastContractVerdicts.every((verdict) => verdict.ok)
+							? `${lastContractVerdicts.map((verdict) => verdict.file).join(", ")} as expected`
+							: lastContractVerdicts
+									.filter((verdict) => !verdict.ok)
+									.map((verdict) => `${verdict.file}: ${verdict.problems.join("; ")}`)
+									.join(" | ")
+				}`,
 				// The ladder decides a step people only notice when it surprises them — the hop taken
 				// once a whole provider is spent. Stating it here is what makes it checkable before it
 				// matters, rather than after.
@@ -8472,6 +8611,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("session_start", async (_event, ctx) => {
 		modelCatalogContext = ctx;
 		preflightHostCapabilities(ctx);
+		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
+		// published them rather than the version our own slot provisioning has just rewritten.
+		checkPiContract(ctx, "session_start");
 		refreshDiscovery(true, ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
@@ -8729,6 +8871,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		handledAssistantErrors.clear();
 		captureDesiredThinking(ctx); // remember the level BEFORE any failover can clamp it
 		refreshDiscovery(false, ctx); // also refresh Pi's in-memory AuthStorage
+		if (pendingSettingsCheck) {
+			// A switch happened; Pi should have rewritten settings.json to name it. If it did not,
+			// every extension-free child spawned from here on runs on the wrong account, and this
+			// is the last place that is still explainable.
+			pendingSettingsCheck = false;
+			checkPiContract(ctx, "after_model_switch", true);
+		}
 		if (!usageStatusTimer) startUsageStatusTimer(ctx);
 		updateUsageStatus(ctx);
 	});
@@ -8736,6 +8885,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	safeOn("model_select", (event, ctx) => {
 		const model = (event as any).model;
 		if (!model?.provider || !model?.id) return;
+		// A user-driven switch goes through Pi's own path, which is the same path that is supposed
+		// to rewrite settings.json — so it deserves the same verification as one of ours.
+		pendingSettingsCheck = true;
 		updateUsageStatus(ctx, model.provider);
 		runBackground("model_select usage refresh", ctx, () =>
 			refreshUsage(ctx, model.provider),
