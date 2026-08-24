@@ -7959,6 +7959,29 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let contextGuardCompactionInFlight = false;
 	let contextGuardLastCompactionAt = 0;
 	let contextGuardNotifiedThisRun = false;
+	// Health of the guard itself. Nothing here lives inside Pi — the guard hangs entirely off Pi's
+	// extension hooks — so a host update cannot delete it, but it CAN quietly stop calling it. Every
+	// handler is crash-isolated, which means a removed or renamed hook does not fail loudly: the
+	// guard simply never runs again and the session goes back to overflowing with nobody watching.
+	// Silent inertness is the failure mode worth reporting, so it is detected and said out loud.
+	let contextGuardHookSeen = false;
+	let contextGuardWindowSeen = false;
+	let contextGuardLlmCalls = 0;
+	const contextGuardWarned = new Set<string>();
+
+	/** How many real LLM responses to wait for before concluding the guard is not being called. */
+	const CONTEXT_GUARD_HEALTH_AFTER_CALLS = 5;
+
+	function contextGuardWarn(ctx: any, kind: string, message: string) {
+		if (contextGuardWarned.has(kind)) return;
+		contextGuardWarned.add(kind);
+		logEvent("context_guard_inert", { kind, message });
+		try {
+			ctx?.ui?.notify?.(`pi-multi-account: ${message}`, "warning");
+		} catch {
+			/* a health warning must never be the thing that breaks a turn */
+		}
+	}
 
 	/** Minimum spacing between two guard-driven compactions, so a session cannot loop on them. */
 	const CONTEXT_GUARD_COMPACTION_COOLDOWN_MS = 120_000;
@@ -7979,6 +8002,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	safeOn("context", (event: any, ctx: any) => {
 		if (!contextGuardActive()) return undefined;
+		contextGuardHookSeen = true; // proof the host still calls us before each request
+		if (typeof ctx?.compact !== "function")
+			contextGuardWarn(
+				ctx,
+				"compact_missing",
+				"this Pi build no longer exposes compaction to extensions, so the context guard can trim " +
+					"requests but can never ask for a summary. Check for an extension update.",
+			);
 		const settings = config.contextGuard;
 		const messages = event?.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return undefined;
@@ -7999,6 +8030,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		contextGuardLastRaw = raw;
 		contextGuardTrimmedLastRequest = false;
 		if (decision.window <= 0) return undefined; // unknown window ⇒ no basis to act
+		contextGuardWindowSeen = true;
 		if (decision.wantCompaction) contextGuardWantsCompaction = true;
 		// Below the soft line there is still work to do once anything has been elided: re-apply it,
 		// or the request prefix flips back and forth and the prompt cache is thrown away each turn.
@@ -8046,8 +8078,28 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// guard's accounting for the rest of the session.
 	safeOn("message_end", (event: any, ctx: any) => {
 		if (!contextGuardActive()) return undefined;
-		if (contextGuardTrimmedLastRequest) return undefined;
 		const usage = event?.message?.usage;
+		if (usage) contextGuardLlmCalls++;
+		if (contextGuardLlmCalls >= CONTEXT_GUARD_HEALTH_AFTER_CALLS) {
+			if (!contextGuardHookSeen) {
+				contextGuardWarn(
+					ctx,
+					"hook_missing",
+					"the context guard is NOT running: this Pi build no longer calls the pre-request hook it " +
+						"needs, so long autonomous runs are unprotected against context overflow again. Check for " +
+						"an extension update.",
+				);
+			} else if (!contextGuardWindowSeen) {
+				contextGuardWarn(
+					ctx,
+					"window_unknown",
+					`the context guard is standing down on ${ctx?.model?.provider}/${ctx?.model?.id}: Pi does not ` +
+						"know this model's context window, so there is nothing to measure against. Give the model a " +
+						"contextWindow in models.json to switch the guard back on.",
+				);
+			}
+		}
+		if (contextGuardTrimmedLastRequest) return undefined;
 		if (!usage || contextGuardLastRaw <= 0) return undefined;
 		const reported =
 			Number(usage.input ?? 0) + Number(usage.cacheRead ?? 0) + Number(usage.cacheWrite ?? 0);

@@ -7313,3 +7313,90 @@ test("the context guard leaves an ordinary conversation completely alone", async
 	await t.fire("agent_settled", {});
 	assert.equal(t.rec.compacts.length, 0);
 });
+
+// The guard lives entirely in this extension, so a Pi update cannot delete it — but it CAN stop
+// calling it. Every handler here is crash-isolated, so a removed hook does not fail loudly: the
+// guard just never runs again. These lock the detection of that silent death.
+
+test("the context guard reports itself when the host stops calling the pre-request hook", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	const usage = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110 };
+	// Six LLM responses and not one `context` event: the hook the guard hangs off is gone.
+	for (let i = 0; i < 6; i++) {
+		await t.fire("message_end", {
+			message: {
+				role: "assistant",
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+				stopReason: "stop",
+				timestamp: 5000 + i,
+				content: [{ type: "text", text: "ok" }],
+				usage,
+			},
+		});
+	}
+	const warning = t.rec.notifies.find((n: string) => n.includes("context guard is NOT running"));
+	assert.ok(warning, `expected a warning, got: ${JSON.stringify(t.rec.notifies)}`);
+	// Said once, not on every turn.
+	assert.equal(
+		t.rec.notifies.filter((n: string) => n.includes("context guard is NOT running")).length,
+		1,
+	);
+});
+
+test("the context guard says so when it has no window to measure against", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	// mkModel has no contextWindow — the guard stands down, and silently standing down is exactly
+	// the state a user must be told about rather than left to discover from an overflow.
+	const usage = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110 };
+	for (let i = 0; i < 6; i++) {
+		await t.fire("context", { messages: bigConversation(1) });
+		await t.fire("message_end", {
+			message: {
+				role: "assistant",
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+				stopReason: "stop",
+				timestamp: 6000 + i,
+				content: [{ type: "text", text: "ok" }],
+				usage,
+			},
+		});
+	}
+	assert.ok(
+		t.rec.notifies.some((n: string) => n.includes("standing down")),
+		`expected a stand-down warning, got: ${JSON.stringify(t.rec.notifies)}`,
+	);
+	assert.equal(
+		t.rec.notifies.some((n: string) => n.includes("context guard is NOT running")),
+		false,
+		"the hook is alive here — only the window is missing",
+	);
+});
+
+test("a healthy guarded session says nothing at all", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+	const usage = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110 };
+	for (let i = 0; i < 6; i++) {
+		await t.fire("context", { messages: bigConversation(1) });
+		await t.fire("message_end", {
+			message: {
+				role: "assistant",
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+				stopReason: "stop",
+				timestamp: 7000 + i,
+				content: [{ type: "text", text: "ok" }],
+				usage,
+			},
+		});
+	}
+	assert.equal(
+		t.rec.notifies.some((n: string) => n.includes("context guard")),
+		false,
+		`a working guard must be silent; got: ${JSON.stringify(t.rec.notifies)}`,
+	);
+});
