@@ -51,6 +51,11 @@ import {
 } from "./cursor-bridge.ts";
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
 import {
+	classifyChildUsability,
+	defaultRouteWarning,
+	type ChildUsability,
+} from "./child-usability.ts";
+import {
 	checkAuthShape,
 	checkModelsShape,
 	checkSettingsTracksActive,
@@ -783,6 +788,41 @@ function inspectPiContract(active?: { provider: string; id: string }): ShapeVerd
 		verdicts.push(check(read.value));
 	}
 	return verdicts;
+}
+
+/**
+ * What a rotation slot looks like to something that does NOT load this extension.
+ *
+ * Read from disk rather than from our own in-memory registry on purpose: the child sees the files,
+ * not our objects, so the files are what has to be judged. A provider that is neither one of our
+ * numbered slots nor present in models.json is one Pi defines itself, and Pi then owns its auth
+ * flow — which is the only case where an OAuth credential works for a child at all.
+ */
+function slotsAsAChildSeesThem(
+	slotIds: readonly string[],
+	auth: Record<string, { type?: string }>,
+): ChildUsability[] {
+	const read = readPublishedJson(MODELS_CONFIG_PATH);
+	const published =
+		read.present && !read.unreadable && typeof (read.value as any)?.providers === "object"
+			? ((read.value as any).providers as Record<string, any>)
+			: {};
+	return slotIds.map((slotId) => {
+		const entry = published[slotId];
+		const credentialType = auth[slotId]?.type;
+		return classifyChildUsability({
+			slotId,
+			credential:
+				credentialType === "oauth"
+					? "oauth"
+					: credentialType === "api_key"
+						? "api_key"
+						: "none",
+			builtin: !/-account-\d+$/.test(slotId) && entry === undefined,
+			publishedApiKey: typeof entry?.apiKey === "string" ? entry.apiKey : undefined,
+			publishedBaseUrl: typeof entry?.baseUrl === "string" ? entry.baseUrl : undefined,
+		});
+	});
 }
 
 type NativeModelEntry = {
@@ -5373,7 +5413,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
 					];
 					registerKimiSlot(pi, id, kimiModels);
-					// Provision into Pi's native registry so extension-free children resolve it.
+					// Provision into Pi's native registry so an extension-free child can RESOLVE the
+					// slot by name. That is all this buys: measured 2026-08-24, such a child then
+					// fails with "No API key found", because Pi honours an OAuth credential only
+					// for a provider definition that declares the flow and a models.json entry
+					// declares none. Making the slot genuinely usable needs the Cursor pattern — a
+					// parent-owned loopback route with a non-secret placeholder — which Kimi does
+					// not have yet. See child-usability.ts.
 					provisionNativeSlot(id, {
 						api: "anthropic-messages",
 						baseUrl: KIMI_BASE_URL,
@@ -8039,6 +8085,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const current = ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "none";
+		// What the rotation looks like to anything that does NOT load this extension: a memory
+		// extension consolidating its notes, an external CLI, any `pi -p --no-extensions` child.
+		// Such a child reads settings.json for the active account, and if that slot is one it
+		// cannot authenticate to it does not fail — it quietly runs on Pi's first available
+		// provider instead, which is a different account and usually a different vendor.
+		const childView = slotsAsAChildSeesThem(rotation, readAuthFile());
+		const childUnusable = childView.filter((verdict) => !verdict.usable);
+		const childRouteWarning = defaultRouteWarning(
+			readHostDefaultModel()?.provider,
+			(slotId) => slotsAsAChildSeesThem([slotId], readAuthFile())[0],
+		);
 		const currentUsage = ctx.model
 			? cachedUsage(ctx.model.provider)
 			: undefined;
@@ -8075,6 +8132,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Compaction routing: ${config.routeCompactionToHealthyAccount ? "to healthy account" : "off"}${compactionRoutedNote ? ` (last: ${compactionRoutedNote})` : ""}${lastContextOverflowAt ? ` · last overflow ${formatUntil(lastContextOverflowAt)}` : ""}`,
 				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
 				`Debug log: ${config.debugLog ? `on → ${DEBUG_LOG_PATH} (/multi-account log to view)` : "off"}`,
+				`Extension-free children: ${childView.length - childUnusable.length}/${childView.length} rotation slots usable${
+					childUnusable.length
+						? ` · cannot authenticate: ${childUnusable.map((verdict) => verdict.slotId).join(", ")}`
+						: ""
+				}${childRouteWarning ? `\n  ⚠️ ${childRouteWarning}` : ""}`,
 				`Config: ${CONFIG_PATH}`,
 				// Pi publishes three files and versions none of the formats, so a silent upgrade is
 				// the failure mode. Stating the last look at them here is what makes it checkable.

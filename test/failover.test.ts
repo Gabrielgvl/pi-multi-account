@@ -7854,3 +7854,82 @@ test("after a switch, settings.json naming the live model is silent", async () =
 	assert.equal(contractWarning(t), undefined, `notifies=${t.rec.notifies.join(" | ")}`);
 	await t.fire("session_shutdown");
 });
+
+// ---------------------------------------------------------------------------
+// What the rotation looks like to something that does NOT load this extension
+// ---------------------------------------------------------------------------
+
+test("status says which rotation slots an extension-free child cannot authenticate to", async () => {
+	// Measured 2026-08-24: a numbered slot with an OAuth credential resolves by name and then
+	// fails with "No API key found", because Pi honours OAuth only for a provider definition that
+	// declares the flow. Publishing the name is not publishing a usable route.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
+			zai: { type: "api_key", key: "sk-zai" },
+		},
+	});
+	await t.fire("session_start");
+	t.rec.notifies.length = 0;
+	await t.command("status");
+	const status = t.rec.notifies.at(-1) ?? "";
+	assert.match(status, /Extension-free children: \d+\/\d+ rotation slots usable/);
+	// The numbered OAuth slot is the unusable one; the built-in and the API-key account are not.
+	assert.match(status, /cannot authenticate: [^\n]*openai-codex-account-2/);
+	assert.equal(/cannot authenticate: [^\n]*\bzai\b/.test(status), false, status);
+	await t.fire("session_shutdown");
+});
+
+test("status warns when the account a bare child would pick up is one it cannot use", async () => {
+	// settings.json is how anything spawned without this extension finds the active account. When
+	// that account is unusable the child does not fail — it silently runs on another vendor. This
+	// is the shape of the real incident: rotation on Codex, consolidation child on Anthropic.
+	rmSync(MODELS, { force: true });
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		settings: { defaultProvider: "openai-codex-account-2", defaultModel: "gpt-5.5" },
+	});
+	await t.fire("session_start");
+	t.rec.notifies.length = 0;
+	await t.command("status");
+	const status = t.rec.notifies.at(-1) ?? "";
+	assert.match(status, /openai-codex-account-2/);
+	assert.match(status, /first-available provider/);
+	await t.fire("session_shutdown");
+});
+
+test("a slot published against a parent-owned loopback route counts as usable", async () => {
+	// This is what the Cursor slots already do: a non-secret placeholder plus a route the parent
+	// serves, so the child authenticates to this machine and the real token never leaves.
+	writeFileSync(
+		MODELS,
+		JSON.stringify({
+			providers: {
+				"openai-codex-account-2": {
+					api: "openai-codex-responses",
+					baseUrl: "http://127.0.0.1:41999/v1",
+					apiKey: "codex-proxy",
+					models: [{ id: "gpt-5.5" }],
+				},
+			},
+		}),
+	);
+	try {
+		const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+		await t.fire("session_start");
+		t.rec.notifies.length = 0;
+		await t.command("status");
+		const status = t.rec.notifies.at(-1) ?? "";
+		assert.equal(
+			/cannot authenticate: [^\n]*openai-codex-account-2/.test(status),
+			false,
+			status,
+		);
+		await t.fire("session_shutdown");
+	} finally {
+		rmSync(MODELS, { force: true });
+	}
+});
