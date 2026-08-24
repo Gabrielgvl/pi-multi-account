@@ -520,6 +520,14 @@ type ProviderFailoverConfig = {
 	// against a 272 000 window with no check at all. `true`/absent uses the
 	// defaults; an object overrides individual thresholds; `false` disables the guard entirely.
 	contextGuard?: boolean | Partial<ContextGuardSettings>;
+	// After an AUTOMATIC compaction, carry the task on instead of stopping and waiting for the
+	// user to type "продовжуй". Pi already has the machinery: `_runAutoCompaction` ends with
+	// `return this.agent.hasQueuedMessages()`, and the run loop turns a `true` there into
+	// `agent.continue()`. Pi uses that on the overflow path but queues nothing on the threshold
+	// path, so a threshold compaction always ends the run. Measured in this machine's own logs:
+	// 49 % of all compactions were followed by the user typing a short "продовжуй", and most of
+	// the rest were the user pasting the summary back in by hand. Default: true.
+	continueAfterCompaction?: boolean;
 	preserveInterruptedContext?: boolean;
 	// When the active account is rate-limited/cooling/invalid and Pi needs to compact
 	// (context overflow or threshold), run the summary on a HEALTHY fallback account
@@ -587,6 +595,7 @@ type RuntimeConfig = Required<
 		| "ignoreErrorPatterns"
 		| "continuationPrompt"
 		| "maxRecheckIntervalMs"
+		| "continueAfterCompaction"
 		| "preserveInterruptedContext"
 		| "routeCompactionToHealthyAccount"
 		| "autoRecoverStuck"
@@ -1430,6 +1439,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
 	contextGuard: true,
+	continueAfterCompaction: true,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
 	autoRecoverStuck: true,
@@ -1627,6 +1637,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			MAX_RECHECK_INTERVAL_MS,
 		),
 		contextGuard: normalizeContextGuard(raw.contextGuard),
+		continueAfterCompaction: raw.continueAfterCompaction ?? true,
 		preserveInterruptedContext: raw.preserveInterruptedContext ?? true,
 		routeCompactionToHealthyAccount:
 			raw.routeCompactionToHealthyAccount ?? true,
@@ -8160,6 +8171,90 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		contextGuardCompactionInFlight = false;
 		contextGuardLastRaw = 0;
 		contextGuardTrimmedLastRequest = false;
+		return undefined;
+	});
+
+	// ---- carry the task on after an automatic compaction --------------------
+	// Pi stops the run whenever a threshold compaction fires, and the user has to type
+	// "продовжуй" to get the work moving again. That is not a missing feature so much as an
+	// unused one: `_runAutoCompaction` ends with
+	//
+	//     return this.agent.hasQueuedMessages();
+	//
+	// and `_runAgentPrompt` turns a `true` there into `await this.agent.continue()`, which drains
+	// the follow-up queue and resumes the run. Pi relies on that path for overflow recovery but
+	// never queues anything itself after a threshold compaction, so `hasQueuedMessages()` is
+	// false and the run simply ends. Queueing one follow-up while the compaction is still in
+	// flight is therefore not a workaround — it is the host's own documented continuation route
+	// ("Auto-compaction can complete while follow-up/steering/custom messages are waiting").
+	//
+	// Measured across this machine's logs (59 compactions): 49 % were followed by the user
+	// typing a short "продовжуй", and most of the remainder were the user pasting the summary
+	// back in by hand or the failover's own continuation prompt. Only a handful were a genuinely
+	// new task.
+	//
+	// `stopReason` does NOT separate "unfinished" from "finished" — after a clean `stop` the
+	// split was 17 continues to 15 new tasks — and neither does any cheap textual signal (no
+	// assistant message in the corpus even ends in a question mark). So instead of guessing from
+	// the outside, the follow-up says plainly that finishing is an allowed answer: a genuinely
+	// complete task is reported in one line rather than padded with invented work.
+	const CONTINUE_AFTER_COMPACTION_TYPE = "multi-account:continue-after-compaction";
+	const CONTINUE_AFTER_COMPACTION_PROMPT = [
+		"The conversation history above was just compacted automatically: it is now a summary plus",
+		"the most recent messages. Nothing was cancelled and nothing was asked of you — carry on with",
+		"the task you were already working on, from the point where it stopped.",
+		"",
+		"- Do not restart the task, and do not redo work the summary records as already done.",
+		"- If you need a result the summary does not carry, re-read the file or re-run the command",
+		"  rather than assuming what it said.",
+		"- If the task really is finished, do not invent more work: say so in one line and stop.",
+	].join("\n");
+
+	safeOn("session_compact", (event: any, ctx: any) => {
+		if (!config.enabled || !config.continueAfterCompaction) return undefined;
+		// Only automatic compactions. A manual /compact (or the context guard's own request at a
+		// settled boundary) is a deliberate pause, not an interruption to paper over.
+		if (event?.reason !== "threshold" && event?.reason !== "overflow") return undefined;
+		// Pi is already retrying this turn by itself; a second queued message would double up.
+		if (event?.willRetry) return undefined;
+		// The run loop must still be live: that is what makes `hasQueuedMessages()` be consulted
+		// and the follow-up queue be drained. When the session is idle the same call would instead
+		// append a stray message that nothing ever delivers.
+		if (ctx?.isIdle?.() !== false) return undefined;
+		// The user pressed Esc, or something is already queued and Pi will continue regardless.
+		if (userAbortedChain || ctx?.signal?.aborted) return undefined;
+		if (ctx?.hasPendingMessages?.()) return undefined;
+		// Shares the failover budget on purpose: between them they must not be able to keep a
+		// task alive forever without the user saying anything.
+		if (autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt) {
+			logEvent("compaction_continue_skipped", {
+				reason: "auto-continue budget spent",
+				used: autoContinuesThisPrompt,
+				budget: config.maxAutoContinuesPerPrompt,
+			});
+			return undefined;
+		}
+
+		autoContinuesThisPrompt++;
+		logEvent("compaction_continue", {
+			compactionReason: event?.reason,
+			model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
+			hop: autoContinuesThisPrompt,
+			budget: config.maxAutoContinuesPerPrompt,
+		});
+		// Queued synchronously: `sendCustomMessage` reaches `agent.followUp()` before its first
+		// await, so the queue is populated by the time `_runAutoCompaction` reads
+		// `hasQueuedMessages()` a few lines later.
+		pi.sendMessage(
+			{
+				customType: CONTINUE_AFTER_COMPACTION_TYPE,
+				content: CONTINUE_AFTER_COMPACTION_PROMPT,
+				// Visible on purpose: the agent carrying on by itself must be something the user
+				// can see a reason for in the transcript, not something that just happens.
+				display: true,
+			} as any,
+			{ deliverAs: "followUp" },
+		);
 		return undefined;
 	});
 

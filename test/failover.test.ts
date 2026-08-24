@@ -264,6 +264,7 @@ function setup(opts: {
 		notifies: [] as string[],
 		statuses: [] as Array<{ key: string; value: string | undefined }>,
 		compacts: [] as Array<Record<string, unknown>>,
+		customMessages: [] as Array<{ message: any; options?: any }>,
 		compactionAuthFor: [] as string[],
 		thinkingLevels: [] as string[],
 		registrations: [] as Array<{ provider: string; models: number | undefined }>,
@@ -453,6 +454,10 @@ function setup(opts: {
 		},
 		sendUserMessage: (prompt: string, options?: Record<string, unknown>) =>
 			rec.sent.push({ prompt, options }),
+		sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+			rec.customMessages.push({ message, options });
+			return Promise.resolve();
+		},
 		continueAgent: async (options?: Record<string, unknown>) => {
 			rec.continueCalls.push({ options });
 			if (opts.continueThrows) throw new Error(opts.continueThrows);
@@ -7399,4 +7404,124 @@ test("a healthy guarded session says nothing at all", async () => {
 		false,
 		`a working guard must be silent; got: ${JSON.stringify(t.rec.notifies)}`,
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Carrying the task on after an automatic compaction
+//
+// Pi ends the run whenever a threshold compaction fires. The continuation route is Pi's own:
+// `_runAutoCompaction` returns `this.agent.hasQueuedMessages()`, and `_runAgentPrompt` turns a
+// `true` there into `agent.continue()`, which drains the follow-up queue. Pi uses that for
+// overflow recovery but queues nothing on the threshold path. These lock the one queued
+// follow-up, and every case where it must stay silent.
+// ---------------------------------------------------------------------------
+
+/** Fire session_compact the way Pi does mid-run: the run loop is still live. */
+async function fireCompact(t: ReturnType<typeof setup>, over: Record<string, unknown> = {}) {
+	t.setIdle(false);
+	return t.fire("session_compact", {
+		compactionEntry: { type: "compaction", summary: "s", firstKeptEntryId: "e1" },
+		fromExtension: false,
+		reason: "threshold",
+		willRetry: false,
+		...over,
+	});
+}
+
+const continuations = (t: ReturnType<typeof setup>) =>
+	t.rec.customMessages.filter(
+		(m) => m.message?.customType === "multi-account:continue-after-compaction",
+	);
+
+test("an automatic compaction carries the task on instead of ending the run", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await t.fire("agent_start");
+	await fireCompact(t);
+
+	const queued = continuations(t);
+	assert.equal(queued.length, 1, "exactly one follow-up may be queued");
+	// followUp is what agent.continue() drains when the last message is an assistant — which is
+	// always the case right after a compaction rebuilt the context.
+	assert.equal(queued[0].options?.deliverAs, "followUp");
+	assert.equal(queued[0].message.display, true, "the user must be able to see why it carried on");
+	const text = String(queued[0].message.content);
+	assert.match(text, /compacted/i);
+	// The escape hatch that makes this safe: ~a third of compactions land on finished work, and
+	// no cheap signal separates them, so the model is told plainly that "done" is a valid answer.
+	assert.match(text, /really is finished/i);
+	assert.match(text, /[Dd]o not restart/);
+});
+
+test("it stays out of the way when Pi is already continuing the turn itself", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await t.fire("agent_start");
+	// Overflow recovery: Pi returns true from _runAutoCompaction on its own and calls continue().
+	await fireCompact(t, { reason: "overflow", willRetry: true });
+	assert.equal(continuations(t).length, 0, "a second queued message would double the turn");
+});
+
+test("a manual /compact is a deliberate pause and is never resumed", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await t.fire("agent_start");
+	await fireCompact(t, { reason: "manual" });
+	assert.equal(continuations(t).length, 0);
+});
+
+test("nothing is queued once the session is idle", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await t.fire("agent_start");
+	t.setIdle(true);
+	// With no live run the follow-up queue is never drained; the same call would instead append a
+	// stray message that nothing delivers.
+	await t.fire("session_compact", {
+		compactionEntry: { type: "compaction", summary: "s", firstKeptEntryId: "e1" },
+		reason: "threshold",
+		willRetry: false,
+	});
+	assert.equal(continuations(t).length, 0);
+});
+
+test("pressing Esc stops the work; a compaction must not undo that", async () => {
+	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await t.fire("agent_start");
+	const aborted = {
+		role: "assistant",
+		provider: "openai-codex",
+		model: "gpt-5.6-sol",
+		stopReason: "aborted",
+		timestamp: messageTimestamp++,
+		content: [{ type: "text", text: "half a thought" }],
+	};
+	t.setIdle(true);
+	await t.fire("agent_end", { messages: [aborted] });
+	await fireCompact(t);
+	assert.equal(continuations(t).length, 0, "the user cancelled — carrying on would override them");
+});
+
+test("the auto-continue budget is shared with failover, not doubled", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { maxAutoContinuesPerPrompt: 2 },
+	});
+	await t.fire("agent_start");
+	await fireCompact(t);
+	await fireCompact(t);
+	assert.equal(continuations(t).length, 2, "within budget");
+	await fireCompact(t);
+	assert.equal(continuations(t).length, 2, "a task must not be able to keep itself alive forever");
+});
+
+test("contextGuard and continueAfterCompaction can each be turned off alone", async () => {
+	const off = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { continueAfterCompaction: false },
+	});
+	await off.fire("agent_start");
+	await fireCompact(off);
+	assert.equal(continuations(off).length, 0);
+
+	const on = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	await on.fire("agent_start");
+	await fireCompact(on);
+	assert.equal(continuations(on).length, 1, "default is on");
 });
