@@ -7525,3 +7525,209 @@ test("contextGuard and continueAfterCompaction can each be turned off alone", as
 	await fireCompact(on);
 	assert.equal(continuations(on).length, 1, "default is on");
 });
+
+// ---------------------------------------------------------------------------
+// The failover ladder — where work goes once the whole provider is spent
+//
+// Rotation's first step already works: 588 of 602 automatic failovers in the black box stayed
+// inside the same provider family. The other 14 had no policy behind them and scattered across
+// five destinations, and not one of the 602 ever reached a per-token account. These lock the
+// ladder that replaces that, and — just as importantly — the two things it must never override.
+// ---------------------------------------------------------------------------
+
+/** Three live families plus a per-token provider, none of them cooling. */
+const LADDER_ACCOUNTS = {
+	anthropic: { type: "oauth" as const, access: "a", refresh: "ar" },
+	"kimi-coding-account-2": { type: "oauth" as const, access: "k", refresh: "kr", accountId: "k2" },
+	cursor: { type: "oauth" as const, access: "c", refresh: "cr", accountId: "cur" },
+	openrouter: { type: "api_key" as const, key: "or-key" },
+};
+
+test("the ladder decides the hop the telemetry cannot", async () => {
+	// Leaving Codex with nothing to separate the survivors: all live, none refused. This is the
+	// exact spot where the old order fell through to discovery sequence and the destination was
+	// effectively arbitrary.
+	const t = setup({
+		accounts: { ...LADDER_ACCOUNTS, "openai-codex": { type: "oauth", access: "o", refresh: "or2" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { providerPriority: ["cursor", "kimi-coding", "anthropic"] },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(
+		t.rec.setModels[0]?.startsWith("cursor/"),
+		`the ladder's first rung must win; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("reordering the ladder reorders the hop", async () => {
+	// The same starting position, one setting different — nothing else may explain the change.
+	const t = setup({
+		accounts: { ...LADDER_ACCOUNTS, "openai-codex": { type: "oauth", access: "o", refresh: "or2" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { providerPriority: ["anthropic", "cursor", "kimi-coding"] },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(
+		t.rec.setModels[0]?.startsWith("anthropic/"),
+		`got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("a per-token account is not spent while a flat-rate one is free", async () => {
+	// Never reached automatically in 602 failovers, which was right — but by accident of
+	// `providerOrder` being unable to name it, not by a policy anyone chose. Now it is the policy.
+	const t = setup({
+		accounts: { ...LADDER_ACCOUNTS, "openai-codex": { type: "oauth", access: "o", refresh: "or2" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(t.rec.setModels.length > 0, "something must have been chosen");
+	assert.equal(
+		t.rec.setModels[0]?.startsWith("openrouter/"),
+		false,
+		`a subscription account was free; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("naming a per-token provider first is honoured — it is the user's money", async () => {
+	const t = setup({
+		accounts: { ...LADDER_ACCOUNTS, "openai-codex": { type: "oauth", access: "o", refresh: "or2" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { providerPriority: ["openrouter", "anthropic"] },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(
+		t.rec.setModels[0]?.startsWith("openrouter/"),
+		`got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("the ladder never pulls work off the current family while a sibling is free", async () => {
+	// The step that already worked, and the one the ladder must not touch: staying on the family
+	// keeps the model the user chose. A ladder that ranks anthropic first must still try the other
+	// Codex slot before leaving Codex at all.
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex": { type: "oauth", access: "o", refresh: "or2", accountId: "c1" },
+			"openai-codex-account-2": { type: "oauth", access: "o2", refresh: "or3", accountId: "c2" },
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { providerPriority: ["anthropic", "openai-codex"] },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(
+		t.rec.setModels[0]?.startsWith("openai-codex-account-2/"),
+		`same-family failover outranks the ladder; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("the ladder never sends work to an account the provider says is spent", async () => {
+	// Evidence about one account beats a preference about its category. An earlier draft put the
+	// ladder above the liveness signals and this is the case that caught it.
+	const now = Date.now();
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-3": { type: "oauth", access: "c3", refresh: "r3", accountId: "codex-3" },
+			alibaba: { type: "api_key", key: "qwen-key" },
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		// Codex is ranked ahead of Qwen — and is also reported 100 % used.
+		config: { providerPriority: ["openai-codex", "qwen"] },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-3": {
+					provider: "openai-codex-account-3",
+					family: "codex",
+					fetchedAt: now - 60 * 60 * 1000,
+					primary: { usedPercent: 100, resetAt: now + 14 * 24 * 60 * 60 * 1000 },
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+	await finishError(t, "anthropic", "claude-opus-4-8", "429 rate_limit_error");
+	assert.ok(
+		t.rec.setModels.some((m) => m.startsWith("alibaba/")),
+		`the live account must win over a higher-ranked spent one; got ${JSON.stringify(t.rec.setModels)}`,
+	);
+});
+
+test("an empty ladder leaves every ordering exactly as it was", async () => {
+	const t = setup({
+		accounts: { ...LADDER_ACCOUNTS, "openai-codex": { type: "oauth", access: "o", refresh: "or2" } },
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { providerPriority: [] },
+	});
+	await finishError(t, "openai-codex", "gpt-5.5", "429 rate limit");
+	assert.ok(t.rec.setModels.length > 0, "failover must still happen with no stated preference");
+});
+
+// ---- the command -----------------------------------------------------------
+
+test("/multi-account priority reports the ladder without changing it", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-5" } });
+	await t.command("priority");
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /failover priority/i);
+	assert.match(said, /1\. anthropic/);
+	assert.match(said, /everything else/);
+	assert.equal(
+		JSON.parse(readFileSync(CONFIG, "utf8")).providerPriority,
+		undefined,
+		"reporting must not write",
+	);
+});
+
+test("/multi-account priority sets, persists and confirms a new ladder", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-5" } });
+	await t.command("priority cursor claude kimi");
+	const said = t.rec.notifies.join("\n");
+	assert.match(said, /1\. cursor/);
+	assert.match(said, /2\. anthropic/, "nicknames are resolved before being stored");
+	assert.match(said, /3\. kimi-coding/);
+	const raw = JSON.parse(readFileSync(CONFIG, "utf8"));
+	assert.deepEqual(raw.providerPriority, ["cursor", "anthropic", "kimi-coding"]);
+});
+
+test("/multi-account priority names providers you are not logged in to", async () => {
+	// Otherwise a typo produces a ladder that looks accepted and silently never applies.
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-5" } });
+	await t.command("priority anthropic totally-made-up");
+	assert.match(t.rec.notifies.join("\n"), /Not logged in.*totally-made-up/s);
+});
+
+test("/multi-account priority rejects an unreadable list instead of wiping the ladder", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-5" } });
+	await t.command("priority ///");
+	assert.match(t.rec.notifies.join("\n"), /could not read any provider name/i);
+	assert.equal(
+		JSON.parse(readFileSync(CONFIG, "utf8")).providerPriority,
+		undefined,
+		"a rejected list must leave the stored ladder untouched",
+	);
+});
+
+test("/multi-account priority distinguishes reset from clear", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-5" } });
+	await t.command("priority none");
+	assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")).providerPriority, []);
+	assert.match(t.rec.notifies.join("\n"), /cleared/i);
+
+	await t.command("priority reset");
+	const raw = JSON.parse(readFileSync(CONFIG, "utf8"));
+	assert.deepEqual(raw.providerPriority, [
+		"anthropic",
+		"openai-codex",
+		"kimi-coding",
+		"cursor",
+		"qwen",
+		"ollama",
+	]);
+});

@@ -48,6 +48,7 @@
     "cursor-model-name.ts",
     "compaction-summary.ts",
     "context-guard.ts",
+    "provider-priority.ts",
     "cursor",
     "README.md",
     "CHANGELOG.md",

@@ -51,6 +51,13 @@ import {
 } from "./cursor-bridge.ts";
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
 import {
+	DEFAULT_PROVIDER_PRIORITY,
+	comparePriority,
+	describePriority,
+	normalizeGroup,
+	normalizePriority,
+} from "./provider-priority.ts";
+import {
 	DEFAULT_CONTEXT_GUARD_SETTINGS,
 	createOverheadTracker,
 	decideGuard,
@@ -485,6 +492,14 @@ type ProviderFailoverConfig = {
 	 */
 	neverFailoverProviders?: string[];
 	providerOrder?: ProviderFamily[];
+	// Where work goes once EVERY account of the current family is spent. An ordered list of
+	// provider groups — a managed family, or the base id of anything else you are logged in to
+	// (`openrouter`, `zai`, `minimax`…), which `providerOrder` could never name. Same-family
+	// failover always runs first and is not affected; an account on a real cooldown is still never
+	// chosen over a free one. Only the order among candidates that are all selectable right now
+	// changes. Anything unlisted sorts after everything listed. Set with
+	// `/multi-account priority ...`.
+	providerPriority?: string[];
 	cooldownMs?: number;
 	probeCooldownMs?: number;
 	invalidCooldownMs?: number;
@@ -578,6 +593,7 @@ type RuntimeConfig = Required<
 		| "onlyActive"
 		| "neverFailoverProviders"
 		| "providerOrder"
+		| "providerPriority"
 		| "cooldownMs"
 		| "probeCooldownMs"
 		| "invalidCooldownMs"
@@ -1419,6 +1435,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	includeCursor: true,
 	neverFailoverProviders: [],
 	providerOrder: DEFAULT_PROVIDER_ORDER,
+	providerPriority: DEFAULT_PROVIDER_PRIORITY,
 	cooldownMs: DEFAULT_COOLDOWN_MS,
 	probeCooldownMs: DEFAULT_PROBE_COOLDOWN_MS,
 	invalidCooldownMs: DEFAULT_INVALID_COOLDOWN_MS,
@@ -1583,6 +1600,11 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 				f === "qwen" ||
 				f === "ollama",
 		),
+		// An explicitly empty list means "no stated preference" and is honoured as such; only an
+		// absent key falls back to the shipped ladder.
+		providerPriority: Array.isArray(raw.providerPriority)
+			? normalizePriority(raw.providerPriority)
+			: [...DEFAULT_PROVIDER_PRIORITY],
 		cooldownMs: positiveOr(raw.cooldownMs, DEFAULT_COOLDOWN_MS),
 		probeCooldownMs: positiveOr(raw.probeCooldownMs, DEFAULT_PROBE_COOLDOWN_MS),
 		invalidCooldownMs: positiveOr(
@@ -5518,6 +5540,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			 * let an unmeasurable, out-of-quota account beat a measured, confirmed one.
 			 */
 			confirmed: boolean;
+			/** Provider group this candidate belongs to — what the priority ladder ranks. */
+			group: string;
 			/** Same provider family (or un-numbered base) as the account that just failed. */
 			sameFamily: boolean;
 			/** Same model identity, including effort-folded Cursor ids. */
@@ -5613,6 +5637,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				predictedBusy:
 					providerRecoveryAt(pick.provider, now, { ignoreCeiling: true }) >
 					now,
+				group,
 				sameFamily: !!currentGroup && group === currentGroup,
 				sameModel:
 					!!currentGroup &&
@@ -5669,6 +5694,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				: 0) ||
 			Number(b.confirmed) - Number(a.confirmed) ||
 			Number(a.predictedBusy) - Number(b.predictedBusy) ||
+			// Every account of the family is spent — the step that had no policy at all. Of 602
+			// automatic failovers in the black box, 588 stayed inside the family and the other 14
+			// scattered across five different destinations, because nothing above rotation index
+			// expressed a preference and the index almost never got a say.
+			//
+			// It sits BELOW the two liveness signals on purpose, and an earlier draft that put it
+			// above them was wrong: evidence about a specific account has to beat a preference
+			// about its category, or a group ranked first would pull work onto an account the
+			// provider has already reported as spent while a live one waited. Two existing tests
+			// said so before this comment did. What is left for the ladder is exactly the case
+			// that was arbitrary — candidates the telemetry cannot separate — where it replaces
+			// "whoever refused longest ago, then whatever order discovery happened to produce"
+			// with a stated answer.
+			comparePriority(a.group, b.group, config.providerPriority) ||
 			a.lastRefusalAt - b.lastRefusalAt ||
 			byRankThenRot(a, b);
 		let availableNow = scored
@@ -7744,6 +7783,86 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
+		if (command === "priority" || command === "order") {
+			const rest = args.trim().split(/\s+/).slice(1).join(" ").trim();
+			const groupsPresent = [
+				...new Set(rotation.map((id) => normalizeGroup(id))),
+			].filter(Boolean);
+
+			// No argument: report, never change. The ladder is the kind of setting people check
+			// far more often than they set.
+			if (!rest) {
+				const lines = describePriority(config.providerPriority, groupsPresent);
+				ctx.ui.notify(
+					[
+						"pi-multi-account: failover priority — where work goes once EVERY account of the",
+						"current provider is spent. Same-provider failover always runs first, and an account",
+						"on cooldown is never chosen over a free one; this only orders the rest.",
+						"",
+						...lines,
+						"",
+						"Set:   /multi-account priority anthropic openai-codex kimi-coding cursor",
+						"Reset: /multi-account priority reset",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+
+			const reset = /^(reset|default|defaults)$/i.test(rest);
+			const cleared = /^(none|off|clear)$/i.test(rest);
+			// "none" is a real answer, distinct from resetting: it says "I have no preference,
+			// decide by liveness alone", which is what an empty ladder means to the comparator.
+			const next = reset
+				? [...DEFAULT_PROVIDER_PRIORITY]
+				: cleared
+					? []
+					: normalizePriority(rest);
+			if (!reset && !cleared && next.length === 0) {
+				ctx.ui.notify(
+					`pi-multi-account: could not read any provider name in "${rest}". Try: /multi-account priority anthropic openai-codex kimi-coding cursor`,
+					"warning",
+				);
+				return;
+			}
+
+			config = { ...config, providerPriority: next };
+			try {
+				const raw = existsSync(CONFIG_PATH)
+					? JSON.parse(readFileSync(CONFIG_PATH, "utf8"))
+					: {};
+				raw.providerPriority = next;
+				writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, "\t")}\n`, {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+			} catch {
+				// non-fatal: the ladder still applies for this session
+			}
+			logEvent("priority_set", { priority: next, reset, cleared });
+
+			// Naming a provider that is not logged in is not an error — people set the ladder they
+			// intend to have, then log in. But it must be said, or a typo looks like it worked.
+			const unknown = next.filter((group) => !groupsPresent.includes(group));
+			ctx.ui.notify(
+				[
+					cleared
+						? "pi-multi-account: failover priority cleared — order decided by live availability alone."
+						: reset
+							? "pi-multi-account: failover priority reset to the default ladder."
+							: "pi-multi-account: failover priority set.",
+					...describePriority(next, groupsPresent),
+					...(unknown.length > 0
+						? [
+								"",
+								`Not logged in (kept in the ladder for when you are): ${unknown.join(", ")}`,
+							]
+						: []),
+				].join("\n"),
+				"info",
+			);
+			return;
+		}
 		if (command === "next") {
 			if (ctx.model) {
 				currentPromptSwitch = undefined;
@@ -7830,12 +7949,20 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				`Auto-continue breaker: ${isBreakerOpen() ? `OPEN — advisory mode until ${formatUntil(breakerOpenUntil)} (manual switching; /multi-account reset to re-enable)` : `closed${recoveryFailures ? ` (${recoveryFailures}/${BREAKER_FAILURE_THRESHOLD} recent failures)` : ""}`}`,
 				`Debug log: ${config.debugLog ? `on → ${DEBUG_LOG_PATH} (/multi-account log to view)` : "off"}`,
 				`Config: ${CONFIG_PATH}`,
+				// The ladder decides a step people only notice when it surprises them — the hop taken
+				// once a whole provider is spent. Stating it here is what makes it checkable before it
+				// matters, rather than after.
+				`Failover priority (after every account of the current provider is spent): ${
+					config.providerPriority.length > 0
+						? `${config.providerPriority.join(" → ")} → everything else`
+						: "none set — decided by live availability alone"
+				} · /multi-account priority to change`,
 				// Switching accounts is the reason most people open this at all, so it gets its own
 				// line with a real account name filled in. Buried mid-way through the pipe-separated
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | best | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | best | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);
