@@ -48,6 +48,7 @@
     "cursor-model-name.ts",
     "compaction-summary.ts",
     "context-guard.ts",
+    "controller-provider.ts",
     "provider-priority.ts",
     "child-usability.ts",
     "pi-contract.ts",
@@ -62,7 +63,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "pack:check": "node scripts/check-package.mjs",
+    "pack:check": "node scripts/check-package.mjs && node scripts/check-tracked-privacy.mjs",
     "release:check": "npm run check && npm test && npm run pack:check",
     "prepublishOnly": "npm run release:check"
   },

@@ -564,3 +564,8 @@ export default async function (pi: ExtensionAPI) {
 
 
 }
+
+/** Drop controller-owned Cursor state after a credentialless task request. */
+export function cleanupControllerSession(sessionId: string): void {
+  cleanupSessionState(sessionId);
+}

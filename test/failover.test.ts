@@ -181,6 +181,14 @@ function setup(opts: {
 		headers?: Record<string, string>;
 	};
 	compactFn?: (...args: any[]) => Promise<any>;
+	/**
+	 * A host whose `ctx.compact()` answers through NEITHER callback.
+	 *
+	 * Not hypothetical: a compaction cancelled by an extension reports through `compaction_end`,
+	 * and the guard's own `onComplete`/`onError` are never called. If that leaves the guard's
+	 * in-flight flag set, it never asks for another summary for the rest of the session.
+	 */
+	compactSilent?: boolean;
 	contextUsage?: {
 		tokens: number | null;
 		contextWindow: number;
@@ -311,6 +319,7 @@ function setup(opts: {
 		// this only at a settled boundary, because the real one begins with an abort().
 		compact: (options?: { onComplete?: (r: unknown) => void; onError?: (e: Error) => void }) => {
 			rec.compacts.push(options ?? {});
+			if (opts.compactSilent) return;
 			queueMicrotask(() => options?.onComplete?.({ summary: "test summary" }));
 		},
 		signal: { aborted: opts.aborted ?? false },
@@ -330,6 +339,7 @@ function setup(opts: {
 				if (models) return models.find((model) => model.id === id);
 				return known.has(provider) ? mkModel(provider, id) : undefined;
 			},
+			getProvider: () => ({ streamSimple: async function* () {} }),
 			getAll: () =>
 				[...known].flatMap((provider) => {
 					if (opts.hostCodexModels && provider === "openai-codex") {
@@ -3689,9 +3699,13 @@ test("startup capability preflight: a fully-capable host raises NO capability no
 	);
 });
 
-test("session_before_compact: leaves Pi's default compaction alone when the active account is healthy", async () => {
+test("session_before_compact: leaves Pi's native compaction alone when the active account is healthy", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		compactFn: async () => {
+			throw new Error("the extension must not replace native compaction");
+		},
 	});
 	const result = await t.fire("session_before_compact", {
 		reason: "threshold",
@@ -3702,20 +3716,35 @@ test("session_before_compact: leaves Pi's default compaction alone when the acti
 		},
 		signal: { aborted: false },
 	});
-	assert.equal(result, undefined, "healthy account → Pi's default compaction");
-	assert.ok(
-		t.rec.compactionAuthFor.some((m) => m.startsWith("anthropic/")),
-		"the current healthy account is the one considered for the summary",
+	assert.equal(result, undefined, "healthy account → Pi's native compaction");
+	assert.equal(
+		t.rec.compactionAuthFor.length,
+		0,
+		"native compaction owns auth and stream setup on a healthy account",
 	);
 });
 
-test("session_before_compact: a healthy current account is compacted with a time bound, not Pi's untimed default", async () => {
-	const tried: string[] = [];
+test("session_before_compact: a routed provider gets the full watchdog budget, not one third", async () => {
+	const asked: string[] = [];
 	const t = setup({
-		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c-tok-2",
+				refresh: "c-ref-2",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex-account-2": 60 * 60 * 1000 },
 		compactionAuth: { ok: true, apiKey: "test-key" },
-		compactFn: async (_p, model) => {
-			tried.push(model.provider);
+		// 55 ms is longer than the old 30 ms (90 / 3), but still within the
+		// configured 90 ms allowance for this provider.
+		config: { compactionWatchdogMs: 90 },
+		compactFn: async (_preparation, model) => {
+			asked.push(model.provider);
+			await wait(55);
 			return COMPACTION_SUMMARY;
 		},
 	});
@@ -3724,40 +3753,21 @@ test("session_before_compact: a healthy current account is compacted with a time
 		preparation: {
 			messagesToSummarize: [],
 			firstKeptEntryId: "e1",
-			tokensBefore: 1000,
+			tokensBefore: 250000,
 		},
 		signal: { aborted: false },
 	});
 	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
-	assert.deepEqual(tried, ["anthropic"], "compacts on the current account; no reroute");
-	assert.ok(
-		!t.rec.notifies.some((n) => /summarizing on/i.test(n)),
-		"no 'summarizing on X instead' toast when the current account itself is live",
-	);
+	assert.deepEqual(asked, ["anthropic"]);
 });
 
-test("session_before_compact: a timed-out compact on the current healthy account is aborted and the next live account is tried", async () => {
-	const tried: string[] = [];
-	let abortedCurrent = false;
+test("session_before_compact: a healthy current account is never sent through the fallback watchdog", async () => {
 	const t = setup({
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		compactionAuth: { ok: true, apiKey: "test-key" },
 		config: { compactionWatchdogMs: 40 },
-		compactFn: (preparation, model, apiKey, headers, instructions, signal) => {
-			tried.push(model.provider);
-			if (model.provider === "anthropic") {
-				return hangingCompact(() => {
-					abortedCurrent = true;
-				})(
-					preparation,
-					model,
-					apiKey,
-					headers,
-					instructions,
-					signal,
-				);
-			}
-			return Promise.resolve(COMPACTION_SUMMARY);
+		compactFn: async () => {
+			throw new Error("native compaction must own the healthy path");
 		},
 	});
 	const result = await t.fire("session_before_compact", {
@@ -3769,13 +3779,8 @@ test("session_before_compact: a timed-out compact on the current healthy account
 		},
 		signal: { aborted: false },
 	});
-	assert.equal(abortedCurrent, true, "the wedged current compact is aborted");
-	assert.ok(tried.includes("anthropic"));
-	assert.ok(
-		tried.includes("openai-codex-account-2"),
-		`next live account is tried after the current one times out; got: ${tried.join(", ")}`,
-	);
-	assert.equal(result?.compaction?.summary, COMPACTION_SUMMARY.summary);
+	assert.equal(result, undefined);
+	assert.equal(t.rec.compactionAuthFor.length, 0);
 });
 
 test("session_before_compact: routes the summary to a healthy account when the active account is cooling", async () => {
@@ -7434,8 +7439,11 @@ const continuations = (t: ReturnType<typeof setup>) =>
 		(m) => m.message?.customType === "multi-account:continue-after-compaction",
 	);
 
-test("an automatic compaction carries the task on instead of ending the run", async () => {
-	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+test("an automatic compaction carries the task on when explicitly enabled", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { continueAfterCompaction: true },
+	});
 	await t.fire("agent_start");
 	await fireCompact(t);
 
@@ -7502,7 +7510,7 @@ test("pressing Esc stops the work; a compaction must not undo that", async () =>
 test("the auto-continue budget is shared with failover, not doubled", async () => {
 	const t = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
-		config: { maxAutoContinuesPerPrompt: 2 },
+		config: { maxAutoContinuesPerPrompt: 2, continueAfterCompaction: true },
 	});
 	await t.fire("agent_start");
 	await fireCompact(t);
@@ -7513,6 +7521,17 @@ test("the auto-continue budget is shared with failover, not doubled", async () =
 });
 
 test("contextGuard and continueAfterCompaction can each be turned off alone", async () => {
+	const defaultOff = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+	});
+	await defaultOff.fire("agent_start");
+	await fireCompact(defaultOff);
+	assert.equal(
+		continuations(defaultOff).length,
+		0,
+		"post-compaction continuation is opt-in to avoid competing with another extension",
+	);
+
 	const off = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
 		config: { continueAfterCompaction: false },
@@ -7521,10 +7540,13 @@ test("contextGuard and continueAfterCompaction can each be turned off alone", as
 	await fireCompact(off);
 	assert.equal(continuations(off).length, 0);
 
-	const on = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
+	const on = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { continueAfterCompaction: true },
+	});
 	await on.fire("agent_start");
 	await fireCompact(on);
-	assert.equal(continuations(on).length, 1, "default is on");
+	assert.equal(continuations(on).length, 1, "explicit opt-in is on");
 });
 
 // ---------------------------------------------------------------------------
@@ -8170,4 +8192,617 @@ test("the Codex slot is published with a token-shaped placeholder that carries n
 		await t.fire("session_shutdown");
 		rmSync(MODELS, { force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// The rotation that never sent a request
+//
+// Recorded on a real machine: 275 account switches in four minutes, alternating between
+// openai-codex-account-2 and openai-codex-account-3 roughly every 1.24 s, with not one request
+// leaving the machine and a free Anthropic account sitting unasked at the top of the ladder.
+// Esc did nothing because there was no run to cancel, and `/multi-account stop` had to be typed
+// several times before it took.
+//
+// The mechanism: `findFallbackModels` admits a same-family sibling whose meter reads 100 % as
+// long as it has "not refused this session", and the pending-resume path rotates onto an account
+// without ever sending it a request — so it never refuses, so it stays admissible for ever. Two
+// such siblings re-admit each other indefinitely, and same-model ranks them above the free
+// account every time.
+// ---------------------------------------------------------------------------
+
+/** Four accounts: three spent Codex slots and one live Anthropic one. */
+const SPENT_CODEX_FLEET: Account = {
+	"openai-codex": { type: "oauth", access: "c1", refresh: "r1", accountId: "codex-1" },
+	"openai-codex-account-2": { type: "oauth", access: "c2", refresh: "r2", accountId: "codex-2" },
+	"openai-codex-account-3": { type: "oauth", access: "c3", refresh: "r3", accountId: "codex-3" },
+	anthropic: { type: "oauth", access: "a1", refresh: "ar1" },
+};
+
+/** A meter that reads "spent" without any refusal having happened yet. */
+function spentCodexUsage(provider: string, now: number) {
+	return {
+		provider,
+		family: "codex",
+		fetchedAt: now,
+		serviceable: false,
+		plan: "free",
+		primary: { usedPercent: 100, resetAt: now + 5 * 60 * 60 * 1000 },
+	};
+}
+
+function spentCodexFleetState(now: number, extra: Record<string, unknown> = {}) {
+	return {
+		stateVersion: 5,
+		exhaustedUntilByProvider: {},
+		exhaustedUntilByModel: {},
+		lastProbeAtByProvider: {},
+		invalidatedByProvider: {},
+		usageByProvider: {
+			"openai-codex": spentCodexUsage("openai-codex", now),
+			"openai-codex-account-2": spentCodexUsage("openai-codex-account-2", now),
+			"openai-codex-account-3": spentCodexUsage("openai-codex-account-3", now),
+			...extra,
+		},
+		lastSwitches: [],
+	};
+}
+
+test("two spent siblings cannot rotate onto each other for ever while a live account waits", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: SPENT_CODEX_FLEET,
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { pendingPollMs: 25, providerOrder: ["openai-codex", "anthropic"] },
+		seedState: spentCodexFleetState(now),
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	await finishError(
+		t,
+		"openai-codex",
+		"gpt-5.5",
+		"Codex error: The usage limit has been reached",
+	);
+	// Long enough for a 25 ms poll to make a dozen hops if nothing bounds it.
+	await wait(500);
+
+	const switches = t.rec.setModels;
+	// Each spent sibling is owed exactly one attempt — its meter is a forecast, and a forecast is
+	// worth one request. Rotating onto it IS that request's worth of doubt, spent.
+	const perAccount = new Map<string, number>();
+	for (const target of switches) {
+		const provider = target.split("/")[0];
+		perAccount.set(provider, (perAccount.get(provider) ?? 0) + 1);
+	}
+	for (const [provider, count] of perAccount) {
+		assert.ok(
+			count <= 1,
+			`no account may be rotated onto twice in one chain; ${provider} was chosen ${count} times (${switches.join(", ")})`,
+		);
+	}
+	assert.ok(
+		switches.some((target) => target.startsWith("anthropic/")),
+		`the live account must be reached once the family is exhausted; got: ${switches.join(", ")}`,
+	);
+	assert.ok(
+		t.rec.continueCalls.length >= 1,
+		"and the interrupted task must actually be resumed there",
+	);
+	// Not merely finite: direct. A wait that has to walk every spent slot in the family before it
+	// reaches the account it can actually use is a minute of switching for nothing, and on a fleet
+	// of seven Codex slots it would spend the whole hop budget getting there.
+	assert.ok(
+		switches.length <= 3,
+		`the live account must be reached without walking the spent ones; got: ${switches.join(", ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("the resume timer only rotates onto an account it could actually resume on", async () => {
+	// The dispatch that follows a timer rotation refuses to resume onto a cooling account — so
+	// rotating onto one tests nothing and changes nothing, it just moves the session sideways.
+	// Everywhere a request is genuinely sent, a forecast-spent sibling still gets its attempt.
+	const now = Date.now();
+	const t = setup({
+		accounts: SPENT_CODEX_FLEET,
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { pendingPollMs: 25 },
+		seedState: spentCodexFleetState(now),
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	const before = t.rec.setModels.length;
+
+	await finishError(
+		t,
+		"openai-codex-account-2",
+		"gpt-5.5",
+		"Codex error: The usage limit has been reached",
+	);
+	await wait(400);
+
+	const chosen = t.rec.setModels.slice(before);
+	const spent = chosen.filter((target) => target.startsWith("openai-codex"));
+	assert.ok(
+		spent.length <= 1,
+		`at most the one sibling that gets a real request may be tried; got: ${chosen.join(", ")}`,
+	);
+	assert.ok(
+		chosen.some((target) => target.startsWith("anthropic/")),
+		`and the session must land somewhere it can actually work; got: ${chosen.join(", ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a rotation that reaches nothing usable stops instead of polling for ever", async () => {
+	// Same fleet, but the Anthropic account is spent too — so there is genuinely nowhere to go.
+	// The wait itself must then be finite and say so, rather than switching account every second
+	// until the user kills the session.
+	const now = Date.now();
+	const t = setup({
+		accounts: SPENT_CODEX_FLEET,
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { pendingPollMs: 25, maxAutoContinuesPerPrompt: 2 },
+		seedState: spentCodexFleetState(now, {
+			anthropic: {
+				provider: "anthropic",
+				family: "anthropic",
+				fetchedAt: now,
+				serviceable: false,
+				primary: { usedPercent: 100, resetAt: now + 5 * 60 * 60 * 1000 },
+			},
+		}),
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	await finishError(
+		t,
+		"openai-codex",
+		"gpt-5.5",
+		"Codex error: The usage limit has been reached",
+	);
+	await wait(500);
+
+	const settled = t.rec.setModels.length;
+	assert.ok(
+		settled <= 4,
+		`a hopeless fleet must stop rotating, not keep switching; got ${settled} switches (${t.rec.setModels.join(", ")})`,
+	);
+	await wait(300);
+	assert.equal(
+		t.rec.setModels.length,
+		settled,
+		"and once stopped it must stay stopped",
+	);
+	// Parking is the right answer — but it has to be said, or a session that has quietly stopped
+	// looks exactly like one that is about to do something.
+	assert.ok(
+		t.rec.notifies.some((message) =>
+			/all accounts are cooling down\. This session will retry automatically/.test(message),
+		),
+		`the user must be told the session is waiting, and for how long; got: ${t.rec.notifies.join(" | ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("one /multi-account stop is enough to end a rotation", async () => {
+	const now = Date.now();
+	const t = setup({
+		accounts: SPENT_CODEX_FLEET,
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		config: { pendingPollMs: 25 },
+		seedState: spentCodexFleetState(now, {
+			anthropic: {
+				provider: "anthropic",
+				family: "anthropic",
+				fetchedAt: now,
+				serviceable: false,
+				primary: { usedPercent: 100, resetAt: now + 5 * 60 * 60 * 1000 },
+			},
+		}),
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+	await finishError(
+		t,
+		"openai-codex",
+		"gpt-5.5",
+		"Codex error: The usage limit has been reached",
+	);
+	await wait(80);
+
+	await t.command("stop");
+	const atStop = t.rec.setModels.length;
+	await wait(300);
+
+	assert.equal(
+		t.rec.setModels.length,
+		atStop,
+		`stop must take on the first attempt; ${t.rec.setModels.length - atStop} further switches happened`,
+	);
+	assert.equal(
+		t.readState().pendingFrom,
+		undefined,
+		"and nothing may be left armed to restart it",
+	);
+	await t.fire("session_shutdown");
+});
+
+// ---------------------------------------------------------------------------
+// Compaction that walked the whole fleet
+//
+// Also recorded: 98 consecutive compaction failures — "insufficient balance", "requires a
+// subscription", "no endpoints found", "does not exist or you do not have access" — because the
+// summary was offered to every account in the rotation in turn, each with the full hang bound of
+// its own, while the user watched "Compacting context…".
+// ---------------------------------------------------------------------------
+
+test("a routed compaction asks a few accounts, not the whole fleet", async () => {
+	const asked: string[] = [];
+	const t = setup({
+		accounts: {
+			"openai-codex": { type: "oauth", access: "c1", refresh: "r1", accountId: "codex-1" },
+			"openai-codex-account-2": { type: "oauth", access: "c2", refresh: "r2", accountId: "codex-2" },
+			"openai-codex-account-3": { type: "oauth", access: "c3", refresh: "r3", accountId: "codex-3" },
+			anthropic: { type: "oauth", access: "a1", refresh: "ar1" },
+			"anthropic-account-2": { type: "oauth", access: "a2", refresh: "ar2" },
+			openrouter: { type: "api_key", key: "or-key" },
+			zai: { type: "api_key", key: "zai-key" },
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { compactionWatchdogMs: 60 },
+		compactFn: (_preparation, model) => {
+			asked.push((model as any).provider);
+			return Promise.reject(new Error("500 the server had an error"));
+		},
+	});
+
+	const result = await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 250000 },
+		signal: { aborted: false },
+	});
+
+	assert.ok(
+		asked.length <= 3,
+		`a compaction must not walk seven accounts; it asked ${asked.length} (${asked.join(", ")})`,
+	);
+	assert.ok(asked.length > 0, "and it must genuinely try");
+	assert.equal(result?.cancel, true, "with nothing to summarize on, it cancels rather than hangs");
+	await t.fire("session_shutdown");
+});
+
+test("an account with no balance is not asked to summarize again five seconds later", async () => {
+	const asked: string[] = [];
+	const t = setup({
+		accounts: {
+			"openai-codex": { type: "oauth", access: "c1", refresh: "r1", accountId: "codex-1" },
+			anthropic: { type: "oauth", access: "a1", refresh: "ar1" },
+		},
+		current: { provider: "openai-codex", id: "gpt-5.5" },
+		seedCooldownsMsFromNow: { "openai-codex": 60 * 60 * 1000 },
+		compactionAuth: { ok: true, apiKey: "test-key" },
+		config: { compactionWatchdogMs: 60 },
+		compactFn: (_preparation, model) => {
+			asked.push((model as any).provider);
+			return Promise.reject(
+				new Error('401: {"type":"CreditsError","message":"Insufficient balance."}'),
+			);
+		},
+	});
+	const preparation = {
+		messagesToSummarize: [],
+		firstKeptEntryId: "e1",
+		tokensBefore: 250000,
+	};
+
+	await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation,
+		signal: { aborted: false },
+	});
+	const firstPass = [...asked];
+	assert.ok(
+		firstPass.includes("anthropic"),
+		`the first pass must have tried it; got: ${firstPass.join(", ")}`,
+	);
+
+	asked.length = 0;
+	await t.fire("session_before_compact", {
+		reason: "threshold",
+		preparation,
+		signal: { aborted: false },
+	});
+	assert.equal(
+		asked.includes("anthropic"),
+		false,
+		`an empty wallet does not refill in seconds; it was asked again: ${asked.join(", ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a compaction that answers through neither callback does not switch the guard off", async () => {
+	// A cancelled compaction reports through `compaction_end`; `onComplete`/`onError` may never
+	// fire. The in-flight flag is the only thing gating the next request, so leaving it set costs
+	// the session every remaining summary — the context then grows until nothing can be sent.
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { compactionWatchdogMs: 30 },
+		compactSilent: true,
+	});
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1, "the guard asked for a summary");
+
+	await wait(200);
+	assert.ok(
+		readDebugLog().some((entry) => entry.kind === "context_guard_compaction_unanswered"),
+		"an unanswered compaction must be written off rather than blocking every later one",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a failed guard compaction clears demand and backs off before retrying", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		config: { compactionWatchdogMs: 30 },
+		compactSilent: true,
+	});
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1, "the guard asks once");
+
+	// A real cancelled host compaction emits compaction_end with no result and may
+	// never invoke either callback supplied to ctx.compact().
+	await t.fire("compaction_end", {
+		reason: "manual",
+		result: undefined,
+		aborted: true,
+		willRetry: false,
+	});
+	await t.fire("context", { messages: bigConversation(50) });
+	await t.fire("agent_settled", {});
+	assert.equal(
+		t.rec.compacts.length,
+		1,
+		"the next settled boundary must not immediately repeat a failed compaction",
+	);
+	await t.fire("session_shutdown");
+});
+
+// ---------------------------------------------------------------------------
+// The governor
+//
+// Eight separate entries in this changelog fix the same shape: an automatic mechanism that ran
+// without progress and could not be stopped. "Runaway failover loop that could freeze the
+// machine", "Escape did not stop the loop", "API-key providers no longer loop forever on a dead
+// key", "a session/rate limit is no longer hot-retried every second", "Compaction no longer
+// leaves 'Compacting context…' spinning forever", "a refusal that cannot be classified no longer
+// strands the session forever", "the stuck-resume watchdog now ACTS instead of only warning",
+// and the 275-switch rotation. Every one was fixed in its own path, and the next path was
+// unbounded again by default.
+//
+// These tests are deliberately about the INVARIANT rather than any of those paths, because a
+// test per path is what has already been tried eight times.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fleet the size of a real one — fifteen accounts across six vendors — so a rotation always has
+ * somewhere else to go and the governor is the only thing that can end the sequence.
+ */
+const WIDE_FLEET: Account = {
+	anthropic: { type: "oauth", access: "a1", refresh: "r1" },
+	"anthropic-account-2": { type: "oauth", access: "a2", refresh: "r2" },
+	"openai-codex": { type: "oauth", access: "c1", refresh: "r3", accountId: "codex-1" },
+	"openai-codex-account-2": { type: "oauth", access: "c2", refresh: "r4", accountId: "codex-2" },
+	"openai-codex-account-3": { type: "oauth", access: "c3", refresh: "r5", accountId: "codex-3" },
+	"openai-codex-account-4": { type: "oauth", access: "c4", refresh: "r7", accountId: "codex-4" },
+	"openai-codex-account-5": { type: "oauth", access: "c5", refresh: "r8", accountId: "codex-5" },
+	"openai-codex-account-6": { type: "oauth", access: "c6", refresh: "r9", accountId: "codex-6" },
+	"openai-codex-account-7": { type: "oauth", access: "c7", refresh: "r10", accountId: "codex-7" },
+	"kimi-coding": { type: "api_key", key: "k1" },
+	"kimi-coding-account-2": { type: "oauth", access: "k2", refresh: "r6" },
+	cursor: { type: "oauth", access: "cu", refresh: "r11" },
+	openrouter: { type: "api_key", key: "or" },
+	zai: { type: "api_key", key: "z" },
+	minimax: { type: "api_key", key: "m" },
+};
+
+test("a session that acts and acts without a single request reaching a provider stops itself", async () => {
+	const t = setup({
+		accounts: WIDE_FLEET,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		// Cooldowns expire at once, so there is always another account to move to. That is the
+		// shape of the bug: never out of options, never actually sending anything.
+		config: { pendingPollMs: 25, cooldownMs: 1, maxAutoContinuesPerPrompt: 99 },
+	});
+	await t.fire("session_start");
+	// One real request, so the governor knows this host reports requests at all. Without having
+	// seen the signal work once it stays dormant on purpose — a safety stop that fires because it
+	// cannot see is worse than the hang it was meant to prevent.
+	t.beforeReq({ messages: [] });
+
+	// Now drive failure after failure. Nothing here sends anything: the harness never emits a
+	// provider request or response, which is precisely the state a spinning session is in.
+	for (let i = 0; i < 20; i++) {
+		await t.fire("agent_start");
+		await finishError(
+			t,
+			t.ctx.model.provider,
+			t.ctx.model.id,
+			"You have hit your usage limit. Try again later.",
+		);
+		if (t.rec.notifies.some((message) => /has STOPPED itself/.test(message))) break;
+	}
+
+	assert.ok(
+		t.rec.notifies.some((message) => /has STOPPED itself/.test(message)),
+		`the session must stop itself rather than keep acting; got: ${t.rec.notifies.slice(-3).join(" | ")}`,
+	);
+	const stopped = readDebugLog().filter((entry) => entry.kind === "governor_stopped");
+	assert.ok(stopped.length > 0, "and it must be recorded, not only shown");
+
+	// Stopped means stopped: no timer, no queue, nothing armed to start it again.
+	const settled = t.rec.setModels.length;
+	await wait(250);
+	assert.equal(
+		t.rec.setModels.length,
+		settled,
+		"nothing may keep switching after the governor has stopped the session",
+	);
+	assert.equal(t.readState().pendingFrom, undefined, "and nothing may be left armed");
+	await t.fire("session_shutdown");
+});
+
+test("stopping never eats the words the user typed", async () => {
+	// The wait queue exists so a message typed during a cooldown is not lost. Every path that
+	// abandons that queue — the governor stopping itself, or the user stopping it by hand — hands
+	// the text back in the same sentence that explains the stop. `/multi-account stop` used to
+	// drop it in silence, which from the outside is the tool eating what you typed.
+	const cooling: Record<string, number> = {};
+	for (const provider of Object.keys(WIDE_FLEET)) cooling[provider] = 10 * 60 * 1000;
+	const t = setup({
+		accounts: WIDE_FLEET,
+		// A single-slot provider on purpose: a family with a spare sibling always has one more
+		// account to try, so the message would go out rather than be held.
+		current: { provider: "openrouter", id: "glm-5.1" },
+		config: { pendingPollMs: 25, maxAutoContinuesPerPrompt: 99 },
+		seedCooldownsMsFromNow: cooling,
+	});
+	await t.fire("session_start");
+
+	const held = await t.input("this sentence must come back to me");
+	assert.equal(held?.action, "handled", "with nothing free, the message is held");
+	assert.equal(t.rec.sent.length, 0, "and nothing was sent");
+
+	await t.command("stop");
+	const stop = t.rec.notifies.at(-1) ?? "";
+	assert.ok(
+		stop.includes("this sentence must come back to me"),
+		`stopping must hand the held text back verbatim; got: ${stop}`,
+	);
+	assert.ok(
+		readDebugLog().some((entry) => entry.kind === "held_messages_returned"),
+		"and record that it did",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a working session is never stopped by the governor", async () => {
+	// The failure mode that would make this cure worse than the disease: stopping a healthy
+	// session because the signals it watches were never emitted. Identical to the test above in
+	// every respect but one — here the requests actually reach providers — so that difference is
+	// the only thing that can explain the different outcome.
+	const t = setup({
+		accounts: WIDE_FLEET,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 25, cooldownMs: 1, maxAutoContinuesPerPrompt: 99 },
+	});
+	await t.fire("session_start");
+	await t.fire("agent_start");
+
+	for (let i = 0; i < 20; i++) {
+		await t.fire("agent_start");
+		// A real request goes out for each attempt, exactly as it would on a live host.
+		t.beforeReq({ messages: [] });
+		await finishError(
+			t,
+			t.ctx.model.provider,
+			t.ctx.model.id,
+			"You have hit your usage limit. Try again later.",
+		);
+	}
+
+	assert.equal(
+		t.rec.notifies.some((message) => /has STOPPED itself/.test(message)),
+		false,
+		`a session whose requests are reaching providers must never be stopped: ${t.rec.notifies.slice(-2).join(" | ")}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("the governor stays dormant on a host that never reports requests", async () => {
+	// Old and unusual Pi builds may emit neither hook. There, "no request was observed" means
+	// "we cannot observe requests", and acting on it would break sessions that are perfectly fine.
+	const t = setup({
+		accounts: WIDE_FLEET,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 25, cooldownMs: 1, maxAutoContinuesPerPrompt: 99 },
+	});
+	await t.fire("session_start");
+	// Deliberately no beforeReq(): this host never tells us a request happened.
+
+	for (let i = 0; i < 20; i++) {
+		await t.fire("agent_start");
+		await finishError(
+			t,
+			t.ctx.model.provider,
+			t.ctx.model.id,
+			"You have hit your usage limit. Try again later.",
+		);
+	}
+
+	assert.equal(
+		t.rec.notifies.some((message) => /has STOPPED itself/.test(message)),
+		false,
+		"an invariant that cannot see its own signal must not act on it",
+	);
+	await t.fire("session_shutdown");
+});
+
+test("a user message re-enables everything the governor stopped", async () => {
+	const t = setup({
+		accounts: WIDE_FLEET,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		config: { pendingPollMs: 25, cooldownMs: 1, maxAutoContinuesPerPrompt: 99 },
+	});
+	await t.fire("session_start");
+	t.beforeReq({ messages: [] });
+	for (let i = 0; i < 20; i++) {
+		await t.fire("agent_start");
+		await finishError(
+			t,
+			t.ctx.model.provider,
+			t.ctx.model.id,
+			"You have hit your usage limit. Try again later.",
+		);
+		if (t.rec.notifies.some((message) => /has STOPPED itself/.test(message))) break;
+	}
+	assert.ok(t.rec.notifies.some((message) => /has STOPPED itself/.test(message)));
+
+	await t.command("status");
+	assert.ok(
+		t.rec.notifies.at(-1)?.includes("Governor: STOPPED"),
+		`status must be able to say the session stopped itself; got: ${t.rec.notifies.at(-1)}`,
+	);
+
+	// A stop the user cannot undo is a session they have to kill. Their next message is the undo.
+	await t.input("carry on then");
+	await t.command("status");
+	assert.ok(
+		t.rec.notifies.at(-1)?.includes("Governor: running"),
+		`a user message must re-enable the machinery; got: ${t.rec.notifies.at(-1)}`,
+	);
+	await t.fire("session_shutdown");
+});
+
+test("session_start installs the parent-owned controller provider pair", async () => {
+	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
+	await t.fire("session_start");
+	assert.deepEqual(Object.keys(t.ctx.controllerProvider).sort(), ["providerTransport", "routeResolver"]);
+	assert.equal(typeof t.ctx.controllerProvider.providerTransport.stream, "function");
+	assert.equal(typeof t.ctx.controllerProvider.routeResolver, "function");
+	await t.fire("session_shutdown");
 });

@@ -48,7 +48,10 @@ type CursorShared = {
 	FALLBACK_MODELS: unknown[];
 	discoverCursorModels?: (accessToken: string) => Promise<unknown[]>;
 };
-type CursorIndex = { registerSessionLifecycleCleanup?: (pi: ExtensionAPI) => void };
+type CursorIndex = {
+	registerSessionLifecycleCleanup?: (pi: ExtensionAPI) => void;
+	cleanupControllerSession?: (sessionId: string) => void;
+};
 
 let sharedModPromise: Promise<CursorShared | undefined> | undefined;
 let indexMod: CursorIndex | undefined;
@@ -208,6 +211,19 @@ export async function setupCursorSubscription(
  * Resolving through {@link getCursorProviderRoot} keeps the `PI_CURSOR_PROVIDER_ROOT`
  * test seam working.
  */
+/**
+ * Controller tasks are not Pi sessions, so the normal session_shutdown hook cannot clean their
+ * Cursor conversation state. The native controller provider calls this after each task request;
+ * the callback is deliberately a no-op when the optional Cursor provider is absent.
+ */
+export function cleanupCursorControllerSession(sessionId: string): void {
+	try {
+		indexMod?.cleanupControllerSession?.(sessionId);
+	} catch {
+		// Cleanup is best effort; it must not turn a settled provider result into a host error.
+	}
+}
+
 export async function refreshCursorCredentials(
 	refreshToken: string,
 ): Promise<{ access: string; refresh: string; expires: number }> {
