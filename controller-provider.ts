@@ -289,7 +289,7 @@ export function createControllerProvider({
 	preparePayload?: (payload: unknown, model: any, snapshot: any) => unknown | undefined;
 	cleanupSession?: (sessionId: string, provider: string) => void;
 	now?: () => number;
-}): { providerTransport: { stream: (snapshot: any, context: any, options?: any) => AsyncIterable<NormalizedEvent> }; routeResolver: (lease: any, request?: any) => Promise<Record<string, unknown>> } {
+}): { providerTransport: { stream: (snapshot: any, context: any, options?: any) => AsyncIterable<NormalizedEvent> }; routeResolver: (lease: any, request?: any) => Promise<Record<string, unknown>>; routePreflight: (request: any) => Promise<Record<string, unknown>> } {
 	if (!modelRegistry || typeof modelRegistry !== "object") throw new Error("controller provider requires a model registry");
 	const resolveAuth = typeof modelRegistry.getApiKeyAndHeaders === "function"
 		? modelRegistry.getApiKeyAndHeaders.bind(modelRegistry)
@@ -300,6 +300,45 @@ export function createControllerProvider({
 	const bindings = new Map<string, RouteBinding>();
 	let registryVersion = 0;
 	let lastRegistryFingerprint = "";
+
+	/**
+	 * Check the exact route that the broker is about to lease without opening a
+	 * provider stream. This is deliberately a safe readiness result: no model
+	 * object, endpoint, credential, or provider error crosses the boundary.
+	 */
+	const routePreflight = async (request: any): Promise<Record<string, unknown>> => {
+		const parsed = parseResourceId(request?.resourceId);
+		if (!parsed) return Object.freeze({ status: "unavailable", reason: "invalid_route", scope: "resource" });
+		let model: any;
+		try {
+			model = resolveModel?.(parsed.provider, parsed.modelId) ?? modelRegistry.find?.(parsed.provider, parsed.modelId);
+		} catch {
+			return Object.freeze({ status: "unavailable", reason: "model_lookup_failed", scope: "resource" });
+		}
+		if (!model || model.provider !== parsed.provider || model.id !== parsed.modelId) {
+			return Object.freeze({ status: "unavailable", reason: "model_not_registered", scope: "resource" });
+		}
+		let providerRuntime: any;
+		try { providerRuntime = modelRegistry.getProvider?.(parsed.provider); } catch {
+			return Object.freeze({ status: "unavailable", reason: "provider_runtime_unavailable", scope: "resource" });
+		}
+		if (!providerRuntime || typeof providerRuntime.streamSimple !== "function") {
+			return Object.freeze({ status: "unavailable", reason: "provider_runtime_unavailable", scope: "resource" });
+		}
+		let auth: any;
+		try { auth = await resolveAuth(model); } catch {
+			return Object.freeze({ status: "unavailable", reason: "credential_resolution_failed", scope: "resource" });
+		}
+		if (!auth || auth.ok !== true || typeof auth.apiKey !== "string" || auth.apiKey.length < 1 || auth.apiKey.length > 4_096 || /[\0\r\n]/.test(auth.apiKey)) {
+			return Object.freeze({ status: "unavailable", reason: "credential_unavailable", scope: "resource" });
+		}
+		let apiDialect: string | undefined;
+		try { apiDialect = modelApi(model, parsed.provider, modelRegistry); } catch {
+			return Object.freeze({ status: "unavailable", reason: "api_dialect_unavailable", scope: "resource" });
+		}
+		if (!apiDialect) return Object.freeze({ status: "unavailable", reason: "api_dialect_unavailable", scope: "resource" });
+		return Object.freeze({ status: "ready" });
+	};
 
 	function pruneBindings(at = now()): void {
 		for (const [leaseId, binding] of bindings) {
@@ -682,11 +721,12 @@ export function createControllerProvider({
 		},
 	};
 
-	return Object.freeze({ providerTransport: Object.freeze(providerTransport), routeResolver });
+	return Object.freeze({ providerTransport: Object.freeze(providerTransport), routeResolver, routePreflight });
 }
 
-export function isControllerProviderPair(value: unknown): value is { providerTransport: { stream: Function }; routeResolver: Function } {
+export function isControllerProviderPair(value: unknown): value is { providerTransport: { stream: Function }; routeResolver: Function; routePreflight: Function } {
 	return Boolean(value && typeof value === "object" && !Array.isArray(value)
 		&& typeof (value as any).providerTransport?.stream === "function"
-		&& typeof (value as any).routeResolver === "function");
+		&& typeof (value as any).routeResolver === "function"
+		&& typeof (value as any).routePreflight === "function");
 }

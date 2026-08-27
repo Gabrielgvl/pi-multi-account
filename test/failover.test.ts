@@ -8801,8 +8801,9 @@ test("a user message re-enables everything the governor stopped", async () => {
 test("session_start installs the parent-owned controller provider pair", async () => {
 	const t = setup({ current: { provider: "anthropic", id: "claude-opus-4-8" } });
 	await t.fire("session_start");
-	assert.deepEqual(Object.keys(t.ctx.controllerProvider).sort(), ["providerTransport", "routeResolver"]);
+	assert.deepEqual(Object.keys(t.ctx.controllerProvider).sort(), ["providerTransport", "routePreflight", "routeResolver"]);
 	assert.equal(typeof t.ctx.controllerProvider.providerTransport.stream, "function");
+	assert.equal(typeof t.ctx.controllerProvider.routePreflight, "function");
 	assert.equal(typeof t.ctx.controllerProvider.routeResolver, "function");
 	await t.fire("session_shutdown");
 });

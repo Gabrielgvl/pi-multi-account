@@ -126,6 +126,21 @@ test("routeResolver covers the current native provider pool without returning cr
 	);
 });
 
+test("routePreflight rejects stale or unresolvable routes without exposing credentials", async () => {
+	const currentModel = model("zai", "glm-5.3", "openai-completions");
+	const { registry } = makeRegistry([currentModel]);
+	const pair = createControllerProvider({ modelRegistry: registry });
+	assert.deepEqual(await pair.routePreflight({ resourceId: "zai/removed-model" }), {
+		status: "unavailable", reason: "model_not_registered", scope: "resource",
+	});
+	assert.deepEqual(await pair.routePreflight({ resourceId: currentModel.provider + "/" + currentModel.id }), { status: "ready" });
+	registry.getApiKeyAndHeaders = async () => ({ ok: false });
+	const unavailablePair = createControllerProvider({ modelRegistry: registry });
+	const unavailable = await unavailablePair.routePreflight({ resourceId: currentModel.provider + "/" + currentModel.id });
+	assert.deepEqual(unavailable, { status: "unavailable", reason: "credential_unavailable", scope: "resource" });
+	assert.doesNotMatch(JSON.stringify(unavailable), new RegExp(SECRET));
+});
+
 test("native transport maps Pi events and consumes one exact lease binding", async () => {
 	const currentModel = model("openai-codex-account-2", "gpt-5.6-luna", "openai-codex-responses");
 	const { registry, calls } = makeRegistry([currentModel]);
