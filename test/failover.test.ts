@@ -1781,6 +1781,18 @@ test("slash commands bypass the cooldown input queue", async () => {
 	assert.equal(t.rec.sent.length, 0);
 });
 
+test("a user prompt arriving during an automatic turn is queued as a follow-up instead of racing the active run", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		idle: false,
+	});
+	const result = await t.input("new owner intent");
+	assert.deepEqual(result, { action: "handled" });
+	assert.deepEqual(t.rec.sent, [
+		{ prompt: "new owner intent", options: { deliverAs: "followUp" } },
+	]);
+});
+
 // ---------------------------------------------------------------------------
 // User control and session-bound automatic resume
 // ---------------------------------------------------------------------------
@@ -6951,13 +6963,18 @@ test("a refreshed credential is persisted through pi 0.84's AuthStorage, which h
 		"Your authentication token has been invalidated. Please try signing in again.",
 	);
 
-	const stored = JSON.parse(readFileSync(AUTH, "utf8")).cursor;
+	const childFacing = JSON.parse(readFileSync(AUTH, "utf8")).cursor;
+	assert.equal(childFacing.type, "api_key");
+	assert.equal(childFacing.key, "cursor-proxy");
+	const sidecar = JSON.parse(
+		readFileSync(join(AGENT_DIR, "pi-multi-account-proxy-oauth.json"), "utf8"),
+	).cursor;
 	assert.equal(
-		stored.refresh,
+		sidecar.refresh,
 		"rotated-refresh:live-refresh",
-		"the rotated refresh token must reach auth.json — the old one is already dead server-side",
+		"the rotated refresh token must reach the parent sidecar — the old one is already dead server-side",
 	);
-	assert.equal(stored.access, "rotated-access:live-refresh");
+	assert.equal(sidecar.access, "rotated-access:live-refresh");
 	assert.ok(
 		!t.readState().invalidatedByProvider?.cursor,
 		"a successful refresh is not a dead account",
@@ -7303,6 +7320,52 @@ test("the context guard asks for a real summary only once the agent has settled"
 	assert.equal(t.rec.compacts.length, 1, "and it must not immediately ask again");
 });
 
+test("a context-guard compaction continues only after its completion callback", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		compactSilent: true,
+	});
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	assert.equal(t.rec.compacts.length, 1);
+	assert.equal(
+		t.rec.sent.length,
+		0,
+		"a guard compaction must not start a new turn while the summary is still in flight",
+	);
+
+	const onComplete = t.rec.compacts[0].onComplete as
+		| ((result: unknown) => void)
+		| undefined;
+	onComplete?.({ summary: "test summary" });
+	assert.equal(t.rec.sent.length, 1, "the completion callback must wake the unfinished task");
+	assert.equal(t.rec.sent[0].options?.deliverAs, "followUp");
+	assert.match(t.rec.sent[0].prompt, /compacted automatically/i);
+});
+
+test("continueAfterCompaction also opts out of context-guard wake", async () => {
+	const t = setup({
+		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		compactSilent: true,
+		config: { continueAfterCompaction: false },
+	});
+	t.ctx.model.contextWindow = 272_000;
+	t.ctx.getSystemPrompt = () => "";
+
+	await t.fire("context", { messages: bigConversation(50) });
+	t.setIdle(true);
+	await t.fire("agent_settled", {});
+	const onComplete = t.rec.compacts[0].onComplete as
+		| ((result: unknown) => void)
+		| undefined;
+	onComplete?.({ summary: "test summary" });
+	assert.equal(t.rec.sent.length, 0, "explicit opt-out must not start a new turn");
+});
+
 test("the context guard stands down when the model's window is unknown", async () => {
 	const t = setup({ current: { provider: "openai-codex", id: "gpt-5.6-sol" } });
 	// mkModel deliberately has no contextWindow: with no window there is no basis for a decision.
@@ -7521,15 +7584,15 @@ test("the auto-continue budget is shared with failover, not doubled", async () =
 });
 
 test("contextGuard and continueAfterCompaction can each be turned off alone", async () => {
-	const defaultOff = setup({
+	const defaultOn = setup({
 		current: { provider: "openai-codex", id: "gpt-5.6-sol" },
 	});
-	await defaultOff.fire("agent_start");
-	await fireCompact(defaultOff);
+	await defaultOn.fire("agent_start");
+	await fireCompact(defaultOn);
 	assert.equal(
-		continuations(defaultOff).length,
-		0,
-		"post-compaction continuation is opt-in to avoid competing with another extension",
+		continuations(defaultOn).length,
+		1,
+		"post-compaction continuation is enabled by default for run-to-completion",
 	);
 
 	const off = setup({

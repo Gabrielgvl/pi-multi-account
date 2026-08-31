@@ -53,6 +53,7 @@
     "child-usability.ts",
     "pi-contract.ts",
     "slot-proxy.ts",
+    "slot-proxy-auth.ts",
     "cursor",
     "README.md",
     "CHANGELOG.md",

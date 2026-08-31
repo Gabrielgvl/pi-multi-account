@@ -16,7 +16,9 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MODEL_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,159}$/;
 const PROVIDER_REASON = /^[a-z_]{1,64}$/;
-const TOOL_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// OpenAI Responses composes tool ids as `${call_id}|${item.id}`. Keep the
+// delimiter scoped to tool-call ids; route/snapshot identifiers remain stricter.
+const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const ROUTE_CACHE_LIMIT = 256;
 const ROUTE_CACHE_TTL_MS = 10 * 60 * 1000;

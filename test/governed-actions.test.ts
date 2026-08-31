@@ -41,7 +41,12 @@ const ALLOWED: Record<string, string> = {
 	attemptQueuedInputResume: "gated by allowAction('send a held message')",
 	"on:session_compact": "gated by allowAction('carry on after compaction')",
 	"on:agent_settled": "gated by allowAction('ask for a summary')",
+	// User-owned input arriving during a competing automatic turn is serialized as a follow-up;
+	// it is not an automatic action and must not be blocked by the governor.
+	"on:input": "preserves newer owner intent by queueing it as followUp",
 	// Reached only from a gated caller.
+	dispatchContextGuardContinuation:
+		"gated by allowAction after the context-guard compaction completion callback",
 	setModelEnsuringVisible: "only called by activateFallback, which is gated",
 	injectContinuationPrompt:
 		"only called from resumeWithExistingContext, which is gated — the fallback half of one gated action",

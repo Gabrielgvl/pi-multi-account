@@ -235,15 +235,15 @@ test("Cursor native routes force SSE instead of a second WebSocket dispatch", as
 	assert.equal(calls[0].request.transport, "sse");
 });
 
-test("native transport forwards tool schemas and tool-call replay without executable functions", async () => {
-	const currentModel = model("kimi-coding", "k3", "anthropic-messages");
+test("native transport forwards tool schemas and Codex compound tool-call ids without executable functions", async () => {
+	const currentModel = model("openai-codex-account-4", "gpt-5.6-sol", "openai-codex-responses");
 	const { registry, calls } = makeRegistry([currentModel], {
 		events: [
 			{ type: "start", partial: {} },
 			{ type: "toolcall_start", contentIndex: 0, partial: {} },
 			{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"greeting.txt"}', partial: {} },
-			{ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call_1", name: "write", arguments: { path: "greeting.txt" } }, partial: {} },
-			{ type: "done", reason: "toolUse", message: { content: [{ type: "toolCall", id: "call_1", name: "write", arguments: { path: "greeting.txt" } }], usage: { input: 4, output: 3 } } },
+			{ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call_1|fc_1", name: "write", arguments: { path: "greeting.txt" } }, partial: {} },
+			{ type: "done", reason: "toolUse", message: { content: [{ type: "toolCall", id: "call_1|fc_1", name: "write", arguments: { path: "greeting.txt" } }], usage: { input: 4, output: 3 } } },
 		],
 	});
 	const pair = createControllerProvider({ modelRegistry: registry });
@@ -275,7 +275,7 @@ test("native transport forwards tool schemas and tool-call replay without execut
 	});
 	assert.deepEqual(output, [
 		{ type: "headers", payload: { httpStatus: 200, providerRequestId: "req-1" } },
-		{ type: "block_start", payload: { index: 0, blockType: "tool_call", id: "call_1", name: "write" } },
+		{ type: "block_start", payload: { index: 0, blockType: "tool_call", id: "call_1|fc_1", name: "write" } },
 		{ type: "tool_call_delta", payload: { index: 0, delta: '{"path":"greeting.txt"}' } },
 		{ type: "block_end", payload: { index: 0, value: '{"path":"greeting.txt"}' } },
 		{ type: "usage", payload: { input: 4, output: 3, cacheRead: 0, cacheWrite: 0 } },

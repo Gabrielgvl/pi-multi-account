@@ -55,12 +55,22 @@ import {
 import { droppedPreviousSummary, restorePreviousSummary } from "./compaction-summary.ts";
 import {
 	admitRequest,
+	dropOwnLoopbackPublications,
+	parseProxyPath,
 	placeholderKeyFor,
+	proxyFamilyFor,
 	publishedRouteFor,
 	shapeUpstreamRequest,
 	type ProxyFamily,
 	type ProxyRoute,
 } from "./slot-proxy.ts";
+import {
+	applyRestoreAll,
+	applyShadowAll,
+	mergeParentAuth,
+	needsAuthShadow,
+	type AuthBlob,
+} from "./slot-proxy-auth.ts";
 import {
 	classifyChildUsability,
 	defaultRouteWarning,
@@ -570,9 +580,9 @@ type ProviderFailoverConfig = {
 	// user to type "продовжуй". Pi already has the machinery: `_runAutoCompaction` ends with
 	// `return this.agent.hasQueuedMessages()`, and the run loop turns a `true` there into
 	// `agent.continue()`. Pi uses that on the overflow path but queues nothing on the threshold
-	// path, so a threshold compaction always ends the run. This is opt-in: another extension (for
-	// example pi-goal) may already own continuation, and an unsolicited follow-up can immediately
-	// grow the context and trigger another compaction. Default: false.
+	// path, so a threshold compaction otherwise ends the run. This is enabled by default for
+	// run-to-completion; another extension (for example pi-goal) may own continuation, in which
+	// case set this explicitly to false to avoid competing follow-ups.
 	continueAfterCompaction?: boolean;
 	preserveInterruptedContext?: boolean;
 	// When the active account is rate-limited/cooling/invalid and Pi needs to compact
@@ -701,6 +711,7 @@ const AGENT_DIR =
 const CONFIG_PATH = join(AGENT_DIR, "provider-failover.json");
 const STATE_PATH = join(AGENT_DIR, "provider-failover-state.json");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
+const PROXY_OAUTH_PATH = join(AGENT_DIR, "pi-multi-account-proxy-oauth.json");
 const MODELS_CONFIG_PATH = join(AGENT_DIR, "models.json");
 const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
@@ -988,6 +999,30 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 		renameSync(tmp, MODELS_CONFIG_PATH);
 	} catch {
 		/* models.json locked/corrupt — the extension registry still works */
+	}
+}
+
+/** Remove loopback publications we wrote, never a user's own models.json entry. */
+function unprovisionOwnLoopbacks(slotIds?: readonly string[]): void {
+	try {
+		if (!existsSync(MODELS_CONFIG_PATH)) return;
+		const parsed = JSON.parse(readFileSync(MODELS_CONFIG_PATH, "utf8"));
+		const providers =
+			typeof parsed?.providers === "object" && parsed.providers !== null
+				? parsed.providers
+				: undefined;
+		if (!providers) return;
+		const nextProviders = dropOwnLoopbackPublications(providers, slotIds);
+		if (JSON.stringify(nextProviders) === JSON.stringify(providers)) return;
+		const next = { ...parsed, providers: nextProviders };
+		const tmp = `${MODELS_CONFIG_PATH}.multi-account.tmp`;
+		writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		renameSync(tmp, MODELS_CONFIG_PATH);
+	} catch {
+		/* leaving a stale loopback is worse than a failed write; next publish retries */
 	}
 }
 
@@ -1624,7 +1659,7 @@ const DEFAULT_CONFIG: ProviderFailoverConfig = {
 	continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
 	maxRecheckIntervalMs: MAX_RECHECK_INTERVAL_MS,
 	contextGuard: true,
-	continueAfterCompaction: false,
+	continueAfterCompaction: true,
 	preserveInterruptedContext: true,
 	routeCompactionToHealthyAccount: true,
 	autoRecoverStuck: true,
@@ -1828,7 +1863,7 @@ function normalizeConfig(raw: ProviderFailoverConfig): RuntimeConfig {
 			MAX_RECHECK_INTERVAL_MS,
 		),
 		contextGuard: normalizeContextGuard(raw.contextGuard),
-		continueAfterCompaction: raw.continueAfterCompaction ?? false,
+		continueAfterCompaction: raw.continueAfterCompaction ?? true,
 		preserveInterruptedContext: raw.preserveInterruptedContext ?? true,
 		routeCompactionToHealthyAccount:
 			raw.routeCompactionToHealthyAccount ?? true,
@@ -2017,7 +2052,7 @@ type AuthEntry = {
 	accountId?: string;
 };
 
-function readAuthFile(): Record<string, AuthEntry> {
+function readAuthFileRaw(): Record<string, AuthEntry> {
 	try {
 		return JSON.parse(readFileSync(AUTH_PATH, "utf8")) as Record<
 			string,
@@ -2026,6 +2061,45 @@ function readAuthFile(): Record<string, AuthEntry> {
 	} catch {
 		return {};
 	}
+}
+
+function readProxyOAuthSidecar(): Record<string, AuthEntry> {
+	try {
+		return JSON.parse(readFileSync(PROXY_OAUTH_PATH, "utf8")) as Record<
+			string,
+			AuthEntry
+		>;
+	} catch {
+		return {};
+	}
+}
+
+function writeProxyOAuthSidecar(data: Record<string, AuthEntry>): void {
+	const tmp = `${PROXY_OAUTH_PATH}.multi-account.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(data, null, "\t")}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	renameSync(tmp, PROXY_OAUTH_PATH);
+}
+
+/**
+ * Parent-facing credentials. While the child proxy is up, numbered OAuth slots are stored as
+ * a placeholder in auth.json so a bare child can authenticate; the real blob lives in the sidecar.
+ */
+function readAuthFile(): Record<string, AuthEntry> {
+	return mergeParentAuth(readAuthFileRaw(), readProxyOAuthSidecar()) as Record<
+		string,
+		AuthEntry
+	>;
+}
+
+function persistChildFacingAuth(
+	auth: Record<string, AuthBlob>,
+	sidecar: Record<string, AuthBlob>,
+): void {
+	writeAuthFile(auth as Record<string, AuthEntry>);
+	writeProxyOAuthSidecar(sidecar as Record<string, AuthEntry>);
 }
 
 /** Atomic replace of auth.json, so a crash mid-write can never truncate credentials. */
@@ -2102,7 +2176,9 @@ export async function persistRefreshedCredentials(
 		}
 	}
 	try {
-		const read = io?.read ?? readAuthFile;
+		// Child-facing auth.json, not the parent merge: spreading the merged view would dump
+		// sidecar OAuth onto every numbered slot a child still has to see as a placeholder.
+		const read = io?.read ?? readAuthFileRaw;
 		const write = io?.write ?? writeAuthFile;
 		write({ ...read(), [provider]: credential });
 		return true;
@@ -2554,12 +2630,13 @@ function registerAnthropicSlot(
 	pi: ExtensionAPI,
 	id: string,
 	modelIds: string[] = DEFAULT_ANTHROPIC_MODELS,
+	baseUrl = "https://api.anthropic.com",
 ) {
 	if (id === ANTHROPIC_BASE) return; // base provider: oauth + shaping registered in piMultiAccount()
 	const models = modelIds.map((m) => anthropicModelDef(m, id));
 	pi.registerProvider(id, {
 		name: `Claude Pro/Max (${id})`,
-		baseUrl: "https://api.anthropic.com",
+		baseUrl,
 		api: "anthropic-messages" as any,
 		oauth: {
 			name: `Claude Pro/Max (${id})`,
@@ -2603,11 +2680,12 @@ function registerCodexSlot(
 	pi: ExtensionAPI,
 	id: string,
 	models: Array<Record<string, unknown>> = DEFAULT_CODEX_MODELS.map(codexModelDef),
+	baseUrl = "https://chatgpt.com/backend-api",
 ) {
 	if (id === CODEX_BASE) return; // base provider is native until live catalog sync enriches it
 	pi.registerProvider(id, {
 		name: `ChatGPT Plus/Pro (Codex ${id})`,
-		baseUrl: "https://chatgpt.com/backend-api",
+		baseUrl,
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, `ChatGPT Plus/Pro (Codex ${id})`),
 		models: models as any,
@@ -4244,6 +4322,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						"OAuth refresh succeeded but the rotated credential could not be written to auth.json; run /login for this account",
 				};
 			}
+			if (needsAuthShadow(provider) && (isCursorProviderId(provider) || slotProxyPort !== undefined)) {
+				shadowChildFacingAuth([provider]);
+			}
 			reloadHostAuth(ctx);
 			refreshDiscovery(true, ctx);
 			return { status: "refreshed" };
@@ -5515,6 +5596,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							models,
 						});
 					}
+					// Same trap as numbered Anthropic/Codex: Pi ignores a models.json placeholder
+					// while an OAuth blob sits under the same key. Measured 2026-08-30 after restart:
+					// `pi -p --no-extensions --model cursor/cursor-grok-4.6` → "No API key found for cursor".
+					shadowChildFacingAuth(slots);
 				},
 			});
 		} catch (error) {
@@ -5593,8 +5678,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					if (apiKeySlotHostSignature.get(id) === signature) continue;
 					apiKeySlotHostSignature.set(id, signature);
 				}
-				if (family === "anthropic") registerAnthropicSlot(pi, id);
-				else if (family === "openai-codex") {
+				if (family === "anthropic") {
+					registerAnthropicSlot(
+						pi,
+						id,
+						DEFAULT_ANTHROPIC_MODELS,
+						numberedSlotBaseUrl(id, "anthropic"),
+					);
+				} else if (family === "openai-codex") {
 					const cached = codexModelCatalogByProvider.get(id)?.models;
 					registerCodexSlot(
 						pi,
@@ -5602,6 +5693,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						config.autoDiscoverModels && cached?.length
 							? (cached as Array<Record<string, unknown>>)
 							: undefined,
+						numberedSlotBaseUrl(id, "codex"),
 					);
 				} else if (family === "kimi-coding") {
 					const kimiModels = [
@@ -7798,10 +7890,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			queuedInputWakeTimer = undefined;
 		}
 		for (let i = 0; i < inputs.length; i++) {
-			pi.sendUserMessage(
-				queuedInputContent(inputs[i]),
-				i === 0 ? undefined : { deliverAs: "followUp" },
-			);
+			// Supplying followUp is harmless while idle, but closes the check→send race if another
+			// automatic turn starts after the idle check and before this call. Await each submission so
+			// two held messages cannot both observe the same idle gap and start competing runs.
+			await pi.sendUserMessage(queuedInputContent(inputs[i]), { deliverAs: "followUp" });
 		}
 		ctx.ui.notify(
 			`Provider failover: resumed ${inputs.length} queued message(s) on ${ctx.model.provider}/${ctx.model.id}.`,
@@ -8650,11 +8742,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Such a child reads settings.json for the active account, and if that slot is one it
 		// cannot authenticate to it does not fail — it quietly runs on Pi's first available
 		// provider instead, which is a different account and usually a different vendor.
-		const childView = slotsAsAChildSeesThem(rotation, readAuthFile());
+		const childView = slotsAsAChildSeesThem(rotation, readAuthFileRaw());
 		const childUnusable = childView.filter((verdict) => !verdict.usable);
 		const childRouteWarning = defaultRouteWarning(
 			readHostDefaultModel()?.provider,
-			(slotId) => slotsAsAChildSeesThem([slotId], readAuthFile())[0],
+			(slotId) => slotsAsAChildSeesThem([slotId], readAuthFileRaw())[0],
 		);
 		const currentUsage = ctx.model
 			? cachedUsage(ctx.model.provider)
@@ -8764,6 +8856,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// requiring a separate pi-anthropic-auth install. Idempotent, so it coexists
 	// safely if pi-anthropic-auth is also present.
 	pi.registerProvider("anthropic", {
+		baseUrl: "https://api.anthropic.com",
 		oauth: anthropicOAuthOverride("anthropic", "Anthropic (Claude Pro/Max)"),
 	} as any);
 	pi.registerProvider("openai-codex", {
@@ -8866,6 +8959,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let contextGuardCompactionInFlight = false;
 	let contextGuardCompactionRetryAfter = 0;
 	let contextGuardLastCompactionAt = 0;
+	// `ctx.compact()` is fire-and-forget. Keep this separate from the in-flight flag because the
+	// host invokes onComplete only AFTER it emits session_compact; the callback is the first safe
+	// idle boundary at which a guard-triggered summary can start the next turn.
+	let contextGuardContinuationPending = false;
 	let contextGuardNotifiedThisRun = false;
 	// Health of the guard itself. Nothing here lives inside Pi — the guard hangs entirely off Pi's
 	// extension hooks — so a host update cannot delete it, but it CAN quietly stop calling it. Every
@@ -9063,6 +9160,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	) {
 		const hadDemand = contextGuardWantsCompaction || contextGuardCompactionInFlight;
 		contextGuardWantsCompaction = false;
+		contextGuardContinuationPending = false;
 		if (hadDemand) {
 			contextGuardCompactionRetryAfter =
 				Date.now() + CONTEXT_GUARD_COMPACTION_FAILURE_BACKOFF_MS;
@@ -9106,6 +9204,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// that must be allowed to stop.
 		if (!allowAction("ask for a summary", ctx)) return undefined;
 		contextGuardCompactionInFlight = true;
+		contextGuardContinuationPending = true;
 		contextGuardLastCompactionAt = Date.now();
 		logEvent("context_guard_compaction_requested", {
 			model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
@@ -9122,6 +9221,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.compact({
 				onComplete: () => {
 					settleContextGuardCompaction();
+					dispatchContextGuardContinuation(ctx);
 				},
 				onError: (error: Error) => {
 					// "Nothing to compact" is a normal answer, not a reason to retry on
@@ -9186,6 +9286,69 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		"  rather than assuming what it said.",
 		"- If the task really is finished, do not invent more work: say so in one line and stop.",
 	].join("\n");
+
+	/**
+	 * Resume a compaction requested by the context guard only after Pi's completion callback.
+	 * Unlike threshold compaction, this path starts while Pi is already idle; queueing a follow-up
+	 * during session_compact would merely append it to history and never run it. A user message
+	 * after the callback both starts a real turn and keeps the normal continuation budget/marker.
+	 */
+	function dispatchContextGuardContinuation(ctx: any) {
+		if (!contextGuardContinuationPending) return;
+		contextGuardContinuationPending = false;
+		if (!config.enabled || !config.continueAfterCompaction) {
+			logEvent("compaction_continue_skipped", {
+				reason: "post-compaction continuation disabled",
+				compactionReason: "context_guard",
+			});
+			return;
+		}
+		if (userAbortedChain || ctx?.signal?.aborted) {
+			logEvent("compaction_continue_skipped", {
+				reason: "user aborted while context-guard compaction was running",
+			});
+			return;
+		}
+		if (ctx?.hasPendingMessages?.()) {
+			logEvent("compaction_continue_skipped", {
+				reason: "another message is already queued after context-guard compaction",
+			});
+			return;
+		}
+		if (ctx?.isIdle?.() === false) {
+			logEvent("compaction_continue_skipped", {
+				reason: "another turn already started after context-guard compaction",
+			});
+			return;
+		}
+		if (autoContinuesThisPrompt >= config.maxAutoContinuesPerPrompt) {
+			logEvent("compaction_continue_skipped", {
+				reason: "auto-continue budget spent",
+				used: autoContinuesThisPrompt,
+				budget: config.maxAutoContinuesPerPrompt,
+			});
+			return;
+		}
+		if (!allowAction("carry on after context-guard compaction", ctx)) return;
+		expectingInjectedContinuation = true;
+		try {
+			pi.sendUserMessage(CONTINUE_AFTER_COMPACTION_PROMPT, {
+				deliverAs: "followUp",
+			});
+			autoContinuesThisPrompt++;
+			logEvent("compaction_continue", {
+				compactionReason: "context_guard",
+				model: `${ctx?.model?.provider}/${ctx?.model?.id}`,
+				hop: autoContinuesThisPrompt,
+				budget: config.maxAutoContinuesPerPrompt,
+			});
+		} catch (error) {
+			expectingInjectedContinuation = false;
+			logEvent("compaction_continue_failed", {
+				error: String(error).slice(0, 200),
+			});
+		}
+	}
 
 	safeOn("session_compact", (event: any, ctx: any) => {
 		if (!config.enabled || !config.continueAfterCompaction) return undefined;
@@ -9261,6 +9424,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	// ----- lifecycle hooks --------------------------------------------------
 
+	let slotProxyServer: Server | undefined;
+	let slotProxyPort: number | undefined;
+	let slotProxyStarting: Promise<number | undefined> | undefined;
+	let slotProxyContext: any;
+	const slotProxyRoutes = new Map<string, ProxyRoute>();
+	/** Preferred port, so a route published last session usually still works. */
+	const SLOT_PROXY_PORT = 41977;
+
 	refreshDiscovery(true);
 
 	// Runtime capability preflight. The RECURRING class of breakage in this extension is the
@@ -9281,21 +9452,25 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// placeholder; this extends the same pattern to the Anthropic and Codex families. Decisions
 	// live in slot-proxy.ts; what is here is the socket and the credential lookup.
 
-	let slotProxyServer: Server | undefined;
-	let slotProxyPort: number | undefined;
-	let slotProxyStarting: Promise<number | undefined> | undefined;
-	let slotProxyContext: any;
-	const slotProxyRoutes = new Map<string, ProxyRoute>();
-	/** Preferred port, so a route published last session usually still works. */
-	const SLOT_PROXY_PORT = 41977;
-
-	/** Numbered OAuth slots are the ones a child cannot otherwise authenticate to. */
 	function proxyFamilyOf(slotId: string): ProxyFamily | undefined {
-		if (!/-account-\d+$/.test(slotId)) return undefined; // base providers are Pi's own
-		const family = classifyProvider(slotId, config.qwenProvider);
-		if (family === "anthropic") return "anthropic";
-		if (family === "openai-codex") return "codex";
-		return undefined;
+		return proxyFamilyFor(slotId);
+	}
+
+	function numberedSlotBaseUrl(id: string, family: ProxyFamily): string {
+		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
+		return family === "anthropic"
+			? "https://api.anthropic.com"
+			: "https://chatgpt.com/backend-api";
+	}
+
+	function restoreChildFacingAuth(): void {
+		const restored = applyRestoreAll(readAuthFileRaw(), readProxyOAuthSidecar());
+		if (restored.changed) persistChildFacingAuth(restored.auth, restored.sidecar);
+	}
+
+	function shadowChildFacingAuth(slotIds: readonly string[]): void {
+		const shadowed = applyShadowAll(slotIds, readAuthFileRaw(), readProxyOAuthSidecar());
+		if (shadowed.changed) persistChildFacingAuth(shadowed.auth, shadowed.sidecar);
 	}
 
 	/** The credential to send upstream, refreshed first when the stored one has expired. */
@@ -9339,10 +9514,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			res.end(JSON.stringify({ error: { message: "this route serves HTTP only" } }));
 			return;
 		}
+		const parsed = parseProxyPath(req.url ?? "");
+		const presentedSecret =
+			parsed && typeof readAuthFile()[parsed.slotId]?.access === "string"
+				? readAuthFile()[parsed.slotId]?.access
+				: undefined;
 		const verdict = admitRequest({
 			rawUrl: req.url ?? "",
 			headers: req.headers ?? {},
 			routes: slotProxyRoutes,
+			acceptedSecrets: presentedSecret ? [presentedSecret] : [],
 		});
 		if (!verdict.ok) {
 			logEvent("slot_proxy_refused", { status: verdict.status, reason: verdict.message });
@@ -9484,22 +9665,36 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		slotProxyServer = undefined;
 		slotProxyPort = undefined;
 		slotProxyRoutes.clear();
+		restoreChildFacingAuth();
+		unprovisionOwnLoopbacks();
 	}
 
 	/**
-	 * Publish every numbered OAuth slot against the running proxy, so a child resolves the slot
-	 * AND can authenticate to it. Without the second half the first is a trap.
+	 * Publish every proxied OAuth account against the running proxy, so a child resolves the
+	 * account AND can authenticate to it. Without the second half the first is a trap.
 	 */
 	async function publishProxiedSlots(ctx: any): Promise<void> {
 		if (!config.childProxy) return;
 		slotProxyContext = ctx ?? slotProxyContext;
-		const auth = readAuthFile();
-		const slots = [...registeredSlots].filter(
-			(id) => proxyFamilyOf(id) !== undefined && isEntryUsable(auth[id]),
-		);
-		if (slots.length === 0) return;
+		const parent = readAuthFile();
+		const slots = [
+			...new Set([
+				...registeredSlots,
+				...Object.keys(parent).filter((id) => proxyFamilyOf(id) !== undefined),
+			]),
+		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]));
+		if (slots.length === 0) {
+			restoreChildFacingAuth();
+			unprovisionOwnLoopbacks();
+			return;
+		}
 		const port = await startSlotProxy();
-		if (port === undefined) return;
+		if (port === undefined) {
+			restoreChildFacingAuth();
+			unprovisionOwnLoopbacks();
+			return;
+		}
+		shadowChildFacingAuth(slots);
 		for (const id of slots) {
 			const family = proxyFamilyOf(id);
 			if (!family) continue;
@@ -9598,8 +9793,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
 		// published them rather than the version our own slot provisioning has just rewritten.
 		checkPiContract(ctx, "session_start");
-		refreshDiscovery(true, ctx);
 		slotProxyContext = ctx;
+		// Bind the loopback before discovery so numbered slots register against this process,
+		// not the real upstream, while a child-facing placeholder is in auth.json.
+		if (config.childProxy) await startSlotProxy();
+		refreshDiscovery(true, ctx);
 		// Publish the OAuth slots against a route this process serves, so anything spawned
 		// without this extension can actually run on the account the rotation chose.
 		await publishProxiedSlots(ctx);
@@ -9786,11 +9984,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("input", async (event, ctx) => {
-		if (
-			!config.enabled ||
-			(event as any).source === "extension" ||
-			!ctx.isIdle()
-		)
+		if (!config.enabled || (event as any).source === "extension")
 			return { action: "continue" as const };
 		const text =
 			typeof (event as any).text === "string" ? (event as any).text : "";
@@ -9808,9 +10002,36 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		retireSpentManualPin();
 		retireSpentFailoverPin();
 
+		// A prompt can arrive while a broker wake or another automatic continuation is starting.
+		// The host's ordinary `prompt()` path has no streamingBehavior in that race and would throw
+		// "Agent is already processing" (or abort the active turn). Re-enter through the explicit
+		// follow-up queue so the user's newer intent is serialized rather than competing with it.
+		if (!ctx.isIdle()) {
+			if ((event as any).streamingBehavior === "steer" || (event as any).streamingBehavior === "followUp") {
+				return { action: "continue" as const };
+			}
+			if (typeof pi.sendUserMessage === "function") {
+				await pi.sendUserMessage(queuedInputContent({ text, images: (event as any).images }), {
+					deliverAs: "followUp",
+				});
+				return { action: "handled" as const };
+			}
+			return { action: "continue" as const };
+		}
+
 		if (
 			await ensureReadyModel(ctx, "preflight: selected account unavailable")
 		) {
+			// Readiness preflight awaits auth/catalog work. The session may have become busy while it
+			// was awaiting; re-check before allowing the original prompt to enter the host run.
+			if (!ctx.isIdle()) {
+				if (typeof pi.sendUserMessage === "function") {
+					await pi.sendUserMessage(queuedInputContent({ text, images: (event as any).images }), {
+						deliverAs: "followUp",
+					});
+					return { action: "handled" as const };
+				}
+			}
 			return { action: "continue" as const };
 		}
 
