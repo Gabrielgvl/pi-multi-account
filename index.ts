@@ -9427,10 +9427,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let slotProxyServer: Server | undefined;
 	let slotProxyPort: number | undefined;
 	let slotProxyStarting: Promise<number | undefined> | undefined;
+	/**
+	 * Another live process already holds the canonical port.
+	 *
+	 * The port is the ownership token for the SHARED FILES published under it. Listening on an
+	 * ephemeral port instead is harmless and stays process-local; rewriting models.json and
+	 * auth.json is not. A short-lived process — a second session, or a `pi-subagents` child,
+	 * which is just another process on this machine — that republished the fleet against itself
+	 * would point the owner's children at a socket that dies with it, and would then restore
+	 * credentials and unpublish routes that were never its own on its way out.
+	 */
+	let slotProxyForeignOwner = false;
 	let slotProxyContext: any;
 	const slotProxyRoutes = new Map<string, ProxyRoute>();
-	/** Preferred port, so a route published last session usually still works. */
-	const SLOT_PROXY_PORT = 41977;
+	/**
+	 * Preferred port, so a route published last session usually still works. Holding it is what
+	 * makes this process the publisher of the shared files. Overridable because a fixed port can
+	 * collide with unrelated software, and because the suite needs a port it can own outright.
+	 */
+	const SLOT_PROXY_PORT =
+		Number(process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT) || 41977;
 
 	refreshDiscovery(true);
 
@@ -9634,8 +9650,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			// learned the hard way.
 			server.on("error", (error: NodeJS.ErrnoException) => {
 				if (error.code === "EADDRINUSE" && server.listening === false && !slotProxyPort) {
-					// Another Pi process already holds the preferred port. Take any free one and
-					// republish; both processes hold the same credentials, so either serves.
+					// Another live process owns this port, and with it every route published
+					// against it. We still take an ephemeral port — serving our own in-process
+					// callers costs nothing — but we are no longer the publisher: the shared
+					// files stay exactly as the owner left them. See slotProxyForeignOwner.
+					slotProxyForeignOwner = true;
+					logEvent("slot_proxy_foreign_owner", { port: SLOT_PROXY_PORT });
 					server.listen(0, "127.0.0.1");
 					return;
 				}
@@ -9665,6 +9685,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		slotProxyServer = undefined;
 		slotProxyPort = undefined;
 		slotProxyRoutes.clear();
+		if (slotProxyForeignOwner) return; // the owner's state outlives this process
 		restoreChildFacingAuth();
 		unprovisionOwnLoopbacks();
 	}
@@ -9684,11 +9705,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			]),
 		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]));
 		if (slots.length === 0) {
-			restoreChildFacingAuth();
-			unprovisionOwnLoopbacks();
+			if (!slotProxyForeignOwner) {
+				restoreChildFacingAuth();
+				unprovisionOwnLoopbacks();
+			}
 			return;
 		}
 		const port = await startSlotProxy();
+		// Ownership is only knowable once the listen attempt resolved. A listener we could not
+		// start at all is ours to clean up; files another live process owns are not ours to
+		// publish, shadow, or tear down.
+		if (slotProxyForeignOwner) return;
 		if (port === undefined) {
 			restoreChildFacingAuth();
 			unprovisionOwnLoopbacks();

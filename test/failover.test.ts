@@ -25,6 +25,15 @@ process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 // The Cursor provider lives in a separate, optional repo. Point the bridge at a directory we
 // control so a test can toggle "installed" / "not installed" — the default is NOT installed,
 // which is what the overwhelming majority of users run.
+// The canonical slot-proxy port decides which extension instance publishes the shared files.
+// Tests routinely leave an instance listening, so every setup() gets its own port: otherwise
+// the first instance would own the port for the whole file and every later publication test
+// would silently exercise the non-owner path instead. `reuseSlotProxyPort` is how a test asks
+// for the opposite — a second instance contending for a port the first one still holds.
+let nextSlotProxyPort = 41500;
+function currentSlotProxyPort(): number {
+	return Number(process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT);
+}
 const CURSOR_ROOT = join(AGENT_DIR, "cursor-provider");
 process.env.PI_CURSOR_PROVIDER_ROOT = CURSOR_ROOT;
 
@@ -217,7 +226,12 @@ function setup(opts: {
 	 * `forceRefreshProvider`, which short-circuits the extension's own refresh path.
 	 */
 	hostAuthStorage?: "pi-0.84";
+	/** Contend for the port the previous instance is still listening on, instead of a fresh one. */
+	reuseSlotProxyPort?: boolean;
 }) {
+	if (!opts.reuseSlotProxyPort) {
+		process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT = String(nextSlotProxyPort++);
+	}
 	const accounts = opts.accounts ?? TWO_ACCOUNTS;
 	writeFileSync(AUTH, JSON.stringify(accounts));
 	writeFileSync(
@@ -7987,6 +8001,65 @@ test("with the proxy off, status warns that the account a bare child picks up is
 	assert.match(status, /openai-codex-account-2/);
 	assert.match(status, /first-available provider/);
 	await t.fire("session_shutdown");
+});
+
+test("a second process that cannot own the canonical port leaves the owner's files alone", async () => {
+	// The listening port IS the ownership token for the SHARED files. A second Pi process — and
+	// a `pi-subagents` child is just another process on this machine — used to hit EADDRINUSE,
+	// quietly take a RANDOM port, and republish every rotation slot against itself. The owner's
+	// children were then pointed at a socket that died the moment that short-lived process
+	// exited, and its shutdown restored auth.json and unpublished routes that were never its
+	// own. A non-owner may serve its own callers, but must not touch models.json or auth.json.
+	const owner = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: {
+			anthropic: { type: "oauth", access: "a-tok-1", refresh: "a-ref-1" },
+			"openai-codex-account-2": { type: "oauth", access: "c-tok-2", refresh: "c-ref-2" },
+		},
+	});
+	await owner.fire("session_start");
+	const ownerRoute = JSON.parse(readFileSync(MODELS, "utf8")).providers[
+		"openai-codex-account-2"
+	]?.baseUrl;
+	assert.match(
+		String(ownerRoute),
+		new RegExp(`^http://127\\.0\\.0\\.1:${currentSlotProxyPort()}/`),
+		"precondition: the owner published its own loopback route",
+	);
+	assert.equal(
+		JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"]?.type,
+		"api_key",
+		"precondition: the owner shadowed the credential a child must not see",
+	);
+
+	// A second instance on the same machine, contending for the port the owner still holds. It
+	// starts from the files exactly as the owner left them — that is what a real second process
+	// finds on disk, shadow and all.
+	const second = setup({
+		reuseSlotProxyPort: true,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		accounts: JSON.parse(readFileSync(AUTH, "utf8")),
+	});
+	await second.fire("session_start");
+	assert.equal(
+		JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex-account-2"].baseUrl,
+		ownerRoute,
+		"a non-owner must not repoint the owner's published route at itself",
+	);
+
+	await second.fire("session_shutdown");
+	const after = JSON.parse(readFileSync(MODELS, "utf8"));
+	assert.equal(
+		after.providers?.["openai-codex-account-2"]?.baseUrl,
+		ownerRoute,
+		"a non-owner must not unpublish the owner's route on its own shutdown",
+	);
+	assert.equal(
+		JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"]?.type,
+		"api_key",
+		"a non-owner must not restore credentials the owner is still shadowing",
+	);
+	await owner.fire("session_shutdown");
 });
 
 test("a slot published against a parent-owned loopback route counts as usable", async () => {
