@@ -119,7 +119,14 @@ const {
 
 test("explicit CLI selection detection follows Pi option parsing", () => {
 	assert.deepEqual(
-		explicitCliSelections(["node", "pi", "--model", "openai/gpt-5.5", "--thinking", "high"]),
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openai/gpt-5.5",
+			"--thinking",
+			"high",
+		]),
 		{ model: true, thinking: true },
 	);
 	for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
@@ -127,17 +134,35 @@ test("explicit CLI selection detection follows Pi option parsing", () => {
 			explicitCliSelections(["node", "pi", "--thinking", level]).thinking,
 			true,
 		);
+		assert.deepEqual(
+			explicitCliSelections([
+				"node",
+				"pi",
+				"--model",
+				`openrouter/acme:model/v1.2+fast@2026-09-01:${level}`,
+			]),
+			{ model: true, thinking: true },
+		);
 	}
 	assert.deepEqual(
 		explicitCliSelections(["node", "pi", "--thinking", "invalid"]),
 		{ model: false, thinking: false },
 	);
 	assert.deepEqual(
-		explicitCliSelections(["node", "pi", "--", "--model", "openai/gpt-5.5"]),
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openrouter/acme:model/v1.2+fast@2026-09-01:turbo",
+		]),
+		{ model: true, thinking: false },
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--", "--model", "openai/gpt-5.5:high"]),
 		{ model: false, thinking: false },
 	);
 	assert.deepEqual(
-		explicitCliSelections(["node", "pi", "--models", "openai/*"]),
+		explicitCliSelections(["node", "pi", "--models", "openai/*:high"]),
 		{ model: false, thinking: false },
 	);
 });
@@ -276,6 +301,8 @@ function setup(opts: {
 	thinkingLevel?: string;
 	/** Thinking level Pi applies while changing models, before model_select is emitted. */
 	modelSetThinkingLevel?: string;
+	/** Deliver a model-induced thinking event before or after model_select. */
+	modelThinkingLevelSelectDelivery?: "before" | "after";
 	/** Emit setThinkingLevel's fire-and-forget host event, optionally after a prior-handler yield. */
 	thinkingLevelSelectDelivery?: "sync" | "delayed";
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
@@ -500,17 +527,17 @@ function setup(opts: {
 		getContextUsage: () => opts.contextUsage,
 	};
 
-	const dispatchThinkingLevelSelect = (payload: {
-		level: string;
-		previousLevel: string;
-	}) => {
+	const dispatchThinkingLevelSelect = (
+		payload: { level: string; previousLevel: string },
+		delayed = opts.thinkingLevelSelectDelivery === "delayed",
+	) => {
 		const delivery = (async () => {
-			if (opts.thinkingLevelSelectDelivery === "delayed")
-				await Promise.resolve();
+			if (delayed) await Promise.resolve();
 			for (const handler of events.thinking_level_select ?? [])
 				await handler(payload, ctx);
 		})();
 		pendingThinkingLevelSelects.push(delivery);
+		return delivery;
 	};
 
 	const pi: any = {
@@ -558,11 +585,16 @@ function setup(opts: {
 			const previousThinkingLevel = sessionThinkingLevel;
 			sessionThinkingLevel = opts.modelSetThinkingLevel ?? clampThinking(sessionThinkingLevel);
 			if (sessionThinkingLevel !== previousThinkingLevel) {
-				for (const handler of events.thinking_level_select ?? [])
-					await handler(
-						{ level: sessionThinkingLevel, previousLevel: previousThinkingLevel },
-						ctx,
-					);
+				const payload = {
+					level: sessionThinkingLevel,
+					previousLevel: previousThinkingLevel,
+				};
+				if (opts.modelThinkingLevelSelectDelivery === "after") {
+					dispatchThinkingLevelSelect(payload, true);
+				} else {
+					for (const handler of events.thinking_level_select ?? [])
+						await handler(payload, ctx);
+				}
 			}
 			for (const handler of events.model_select ?? [])
 				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
@@ -3062,6 +3094,40 @@ test("explicit CLI model wins over remembered startup state and is not remembere
 	assert.equal(t.readState().lastUserThinkingLevel, "low");
 });
 
+test("explicit CLI thinking survives a startup fallback before agent_start", async (suite) => {
+	const model = "missing.provider/acme:model/v1.2+fast@2026-09-01";
+	for (const { name, cliArgs } of [
+		{ name: "model shorthand", cliArgs: ["--model", `${model}:high`] },
+		{
+			name: "standalone thinking precedence",
+			cliArgs: ["--thinking", "high", "--model", `${model}:low`],
+		},
+	]) {
+		await suite.test(name, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				},
+				current: {
+					provider: "missing.provider",
+					id: "acme:model/v1.2+fast@2026-09-01",
+				},
+				thinkingLevel: "high",
+				modelSetThinkingLevel: "low",
+				config: { fallbacks: ["anthropic"] },
+				cliArgs,
+			});
+			await t.fire("session_start", { reason: "startup" });
+			assert.equal(t.ctx.model.provider, "anthropic");
+			assert.equal(
+				t.thinkingLevel(),
+				"high",
+				"the explicit level must survive fallback before agent_start can capture it",
+			);
+		});
+	}
+});
+
 test("explicit CLI thinking wins while ordinary model restoration remains enabled", async () => {
 	const t = setup({
 		accounts: {
@@ -3155,39 +3221,66 @@ test("internal thinking restores do not become explicit CLI intent", async (suit
 	}
 });
 
-test("explicit CLI model keeps a native model thinking reset out of remembered state", async () => {
-	const t = setup({
-		accounts: {
-			anthropic: { type: "oauth", access: "a", refresh: "ar" },
-			"openai-codex-account-2": {
-				type: "oauth",
-				access: "c",
-				refresh: "cr",
-				accountId: "codex-2",
-			},
-		},
-		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
-		thinkingLevel: "high",
-		modelSetThinkingLevel: "low",
-		config: { enabled: false },
-		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
-		seedState: {
-			stateVersion: 5,
-			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
-			lastUserThinkingLevel: "high",
-			lastModelByFamily: { anthropic: "claude-opus-4-8" },
-			lastSwitches: [],
-		},
-	});
-	await t.fire("session_start", { reason: "startup" });
-	await t.setModel("anthropic", "claude-opus-4-8");
-	assert.equal(t.thinkingLevel(), "low");
-	await t.fire("session_shutdown");
-	assert.deepEqual(t.readState().lastUserModel, {
-		provider: "anthropic",
-		id: "claude-opus-4-8",
-	});
-	assert.equal(t.readState().lastUserThinkingLevel, "high");
+test("native model thinking resets do not become explicit CLI intent", async (suite) => {
+	for (const delivery of ["before", "after"] as const) {
+		await suite.test(`${delivery} model_select delivery`, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+				thinkingLevel: "high",
+				modelSetThinkingLevel: "low",
+				modelThinkingLevelSelectDelivery: delivery,
+				config: { enabled: false },
+				cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "high",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.setModel("anthropic", "claude-opus-4-8");
+			await t.settleThinkingLevelSelects();
+			assert.equal(t.thinkingLevel(), "low");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"the model's native reset must not become remembered user intent",
+			);
+
+			// Recreate the same high -> low key after its one-shot evidence was consumed.
+			t.userSetsThinking("high");
+			await t.fire("thinking_level_select", {
+				level: "high",
+				previousLevel: "low",
+			});
+			t.userSetsThinking("low");
+			await t.fire("thinking_level_select", {
+				level: "low",
+				previousLevel: "high",
+			});
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, {
+				provider: "anthropic",
+				id: "claude-opus-4-8",
+			});
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"low",
+				"a later genuine identical choice must not be hidden",
+			);
+		});
+	}
 });
 
 test("explicit CLI model can be replaced by a genuine thinking selection only", async () => {
