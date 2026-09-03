@@ -3500,6 +3500,39 @@ test("manual rotation commands own the model preference after an explicit CLI la
 	}
 });
 
+test("manual no-op choices own the model preference after an explicit CLI launch", async (suite) => {
+	for (const command of ["best", "switch openai-codex-account-2/gpt-5.5"]) {
+		await suite.test(command, async () => {
+			const current = { provider: "openai-codex-account-2", id: "gpt-5.5" };
+			const t = setup({
+				accounts: {
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current,
+				thinkingLevel: "high",
+				cliArgs: ["--model", `${current.provider}/${current.id}`],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "low",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.command(command);
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, current);
+			assert.equal(t.readState().lastUserThinkingLevel, "low");
+		});
+	}
+});
+
 test("pi-subagents child keeps its explicit launch model and delegates fallback to the parent runner", async () => {
 	const t = setup({
 		accounts: {

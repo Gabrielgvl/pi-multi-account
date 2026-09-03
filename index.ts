@@ -6678,6 +6678,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (failedProviders.has(fallback.provider)) continue;
 			const to = ref(fallback.provider, fallback.id);
 			if (to === from) {
+				if (options.manual && candidates.length === 1) {
+					modelPreferenceChanged = true;
+					rememberUserModel(sourceModel);
+					return true;
+				}
 				markExhausted(fallback.provider, config.transientCooldownMs);
 				failedProviders.add(fallback.provider);
 				continue;
@@ -9024,6 +9029,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				candidates[0].provider === ctx.model.provider &&
 				candidates[0].id === ctx.model.id
 			) {
+				modelPreferenceChanged = true;
+				rememberUserModel(ctx.model);
 				ctx.ui.notify(
 					`pi-multi-account: already on the best available account (${ctx.model.provider}/${ctx.model.id})`,
 					"info",
