@@ -3712,7 +3712,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** pi.setModel that first restores the target's models when the filter hid them. */
-	let internalThinkingChanges = 0;
+	let internalModelChanges = 0;
 	async function setModelEnsuringVisible(
 		target: { provider: string; id: string },
 		ctx: any,
@@ -3720,11 +3720,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (onlyActiveModels) unhideProvider(target.provider);
 		// Pi rewrites settings.json on this path; the next turn checks that it actually did.
 		pendingSettingsCheck = true;
-		internalThinkingChanges++;
+		internalModelChanges++;
 		try {
 			return await pi.setModel(target as any);
 		} finally {
-			internalThinkingChanges--;
+			internalModelChanges--;
 		}
 	}
 
@@ -4085,6 +4085,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// What the host applied after we asserted the session's intent, and on which model. A
 	// capability clamp or model default is NOT a user decision, otherwise thinking ratchets.
 	let thinkingClamp: { model: string; level: ReasoningLevel } | undefined;
+	type InternalThinkingChangeEvidence = {
+		model: string;
+		previousLevel: ReasoningLevel;
+		appliedLevel: ReasoningLevel;
+	};
+	const pendingInternalThinkingChanges: InternalThinkingChangeEvidence[] = [];
+	const MAX_PENDING_INTERNAL_THINKING_CHANGES = 8;
+	let activeInternalThinkingChange:
+		| (Omit<InternalThinkingChangeEvidence, "appliedLevel"> & {
+				appliedLevel?: ReasoningLevel;
+			})
+		| undefined;
 
 	const thinkingRank = (level: unknown) =>
 		REASONING_LEVELS.indexOf(level as ReasoningLevel);
@@ -4106,6 +4118,38 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx?.model?.provider && ctx?.model?.id
 			? ref(ctx.model.provider, ctx.model.id)
 			: "unknown";
+
+	function consumeInternalThinkingChange(
+		event: any,
+		ctx: any,
+		appliedLevel: ReasoningLevel,
+	): boolean {
+		const previousLevel = event?.previousLevel;
+		if (thinkingRank(previousLevel) < 0) return false;
+		const model = thinkingModelKey(ctx);
+		const active = activeInternalThinkingChange;
+		// The first extension handler can run inside setThinkingLevel(), before the applied level
+		// is available to restoreDesiredThinking(). Reading it here completes the same exact key.
+		if (
+			active &&
+			active.model === model &&
+			active.previousLevel === previousLevel &&
+			readThinkingLevel() === appliedLevel
+		) {
+			active.appliedLevel = appliedLevel;
+			activeInternalThinkingChange = undefined;
+			return true;
+		}
+		const pending = pendingInternalThinkingChanges.findIndex(
+			(change) =>
+				change.model === model &&
+				change.previousLevel === previousLevel &&
+				change.appliedLevel === appliedLevel,
+		);
+		if (pending < 0) return false;
+		pendingInternalThinkingChanges.splice(pending, 1);
+		return true;
+	}
 
 	// A level lower than the intent that is exactly what the host produced last time we asserted
 	// the intent on THIS model is a clamp, not the user lowering thinking on purpose.
@@ -4145,17 +4189,33 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function restoreDesiredThinking(ctx?: any) {
 		if (!desiredThinkingLevel) return;
-		internalThinkingChanges++;
+		const previousLevel = readThinkingLevel();
+		const attempted: typeof activeInternalThinkingChange = previousLevel
+			? { model: thinkingModelKey(ctx), previousLevel }
+			: undefined;
+		if (attempted) activeInternalThinkingChange = attempted;
 		try {
 			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
 			/* setThinkingLevel clamps to model caps; ignore if unsupported */
 		} finally {
-			internalThinkingChanges--;
+			if (activeInternalThinkingChange === attempted)
+				activeInternalThinkingChange = undefined;
 		}
 		// Record a clamp so the next turn does not mistake the fallback model's cap for intent.
 		const applied = readThinkingLevel();
 		if (!applied) return;
+		if (
+			attempted &&
+			applied !== previousLevel &&
+			attempted.appliedLevel === undefined
+		) {
+			pendingInternalThinkingChanges.push({ ...attempted, appliedLevel: applied });
+			// Keep suppression one-shot and bounded. If the host stops delivering events, drop the
+			// oldest evidence instead of accumulating permanent future suppressions.
+			if (pendingInternalThinkingChanges.length > MAX_PENDING_INTERNAL_THINKING_CHANGES)
+				pendingInternalThinkingChanges.shift();
+		}
 		if (applied !== desiredThinkingLevel) {
 			thinkingClamp = { model: thinkingModelKey(ctx), level: applied };
 			logEvent("thinking_clamped", {
@@ -8015,7 +8075,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				) {
 					automaticModelTarget = same;
 					if (onlyActiveModels) unhideProvider(sourceModel.provider);
-					internalThinkingChanges++;
+					internalModelChanges++;
 					try {
 						await pi.setModel(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
@@ -8024,7 +8084,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							},
 						);
 					} finally {
-						internalThinkingChanges--;
+						internalModelChanges--;
 						if (automaticModelTarget === same) automaticModelTarget = undefined;
 					}
 				}
@@ -10634,9 +10694,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	});
 
 	safeOn("thinking_level_select", (event, ctx) => {
-		if (subagentChild || internalThinkingChanges > 0) return;
+		if (subagentChild) return;
 		const level = (event as any).level;
 		if (thinkingRank(level) < 0) return;
+		if (consumeInternalThinkingChange(event, ctx, level as ReasoningLevel)) return;
+		if (internalModelChanges > 0) return;
 		const modelKey = thinkingModelKey(ctx);
 		// Pi applies a model's thinking default/clamp before it emits model_select. The changed
 		// ctx.model identifies that one event; do not turn it into user intent.

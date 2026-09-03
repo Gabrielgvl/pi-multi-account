@@ -276,6 +276,8 @@ function setup(opts: {
 	thinkingLevel?: string;
 	/** Thinking level Pi applies while changing models, before model_select is emitted. */
 	modelSetThinkingLevel?: string;
+	/** Emit setThinkingLevel's fire-and-forget host event, optionally after a prior-handler yield. */
+	thinkingLevelSelectDelivery?: "sync" | "delayed";
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
 	thinkingCaps?: Record<string, string>;
 	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
@@ -390,6 +392,7 @@ function setup(opts: {
 	const events: Record<string, Array<(event: any, ctx?: any) => any>> = {};
 	const busEvents = new Map<string, Array<(payload: any) => void>>();
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
+	const pendingThinkingLevelSelects: Promise<void>[] = [];
 
 	const ctx: any = {
 		model: opts.current
@@ -497,6 +500,19 @@ function setup(opts: {
 		getContextUsage: () => opts.contextUsage,
 	};
 
+	const dispatchThinkingLevelSelect = (payload: {
+		level: string;
+		previousLevel: string;
+	}) => {
+		const delivery = (async () => {
+			if (opts.thinkingLevelSelectDelivery === "delayed")
+				await Promise.resolve();
+			for (const handler of events.thinking_level_select ?? [])
+				await handler(payload, ctx);
+		})();
+		pendingThinkingLevelSelects.push(delivery);
+	};
+
 	const pi: any = {
 		events: {
 			on: (name: string, handler: (payload: any) => void) => {
@@ -567,7 +583,17 @@ function setup(opts: {
 		getThinkingLevel: () => sessionThinkingLevel,
 		setThinkingLevel: (level: string) => {
 			rec.thinkingLevels.push(level); // what the extension ASKED for
+			const previousLevel = sessionThinkingLevel;
 			sessionThinkingLevel = clampThinking(level); // what the host actually applied
+			if (
+				opts.thinkingLevelSelectDelivery &&
+				sessionThinkingLevel !== previousLevel
+			) {
+				dispatchThinkingLevelSelect({
+					level: sessionThinkingLevel,
+					previousLevel,
+				});
+			}
 		},
 	};
 
@@ -665,6 +691,10 @@ function setup(opts: {
 	const userSetsThinking = (level: string) => {
 		sessionThinkingLevel = clampThinking(level);
 	};
+	const settleThinkingLevelSelects = async () => {
+		while (pendingThinkingLevelSelects.length > 0)
+			await Promise.all(pendingThinkingLevelSelects.splice(0));
+	};
 
 	return {
 		ctx,
@@ -679,6 +709,7 @@ function setup(opts: {
 		input,
 		thinkingLevel,
 		userSetsThinking,
+		settleThinkingLevelSelects,
 		providerConfigs,
 	};
 }
@@ -3072,6 +3103,56 @@ test("explicit CLI thinking wins while ordinary model restoration remains enable
 		id: "claude-opus-4-8",
 	});
 	assert.equal(t.readState().lastUserThinkingLevel, "medium");
+});
+
+test("internal thinking restores do not become explicit CLI intent", async (suite) => {
+	for (const delivery of ["sync", "delayed"] as const) {
+		await suite.test(`${delivery} thinking event delivery`, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+				},
+				current: { provider: "anthropic", id: "claude-opus-4-8" },
+				thinkingLevel: "low",
+				thinkingLevelSelectDelivery: delivery,
+				config: { enabled: false },
+				cliArgs: ["--thinking", "high"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+					lastUserThinkingLevel: "medium",
+					lastModelByFamily: { anthropic: "claude-opus-4-8" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.settleThinkingLevelSelects();
+			assert.equal(t.thinkingLevel(), "high");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"medium",
+				"the extension's own restore must not persist the one-shot CLI level",
+			);
+
+			// Recreate the exact low -> high event key after the internal event was consumed.
+			t.userSetsThinking("low");
+			await t.fire("thinking_level_select", {
+				level: "low",
+				previousLevel: "high",
+			});
+			t.userSetsThinking("high");
+			await t.fire("thinking_level_select", {
+				level: "high",
+				previousLevel: "low",
+			});
+			await t.fire("session_shutdown");
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"a later genuine identical choice must take ownership of thinking intent",
+			);
+		});
+	}
 });
 
 test("explicit CLI model keeps a native model thinking reset out of remembered state", async () => {
