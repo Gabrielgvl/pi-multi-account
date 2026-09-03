@@ -134,16 +134,17 @@ test("explicit CLI selection detection follows Pi option parsing", () => {
 			explicitCliSelections(["node", "pi", "--thinking", level]).thinking,
 			true,
 		);
-		assert.deepEqual(
-			explicitCliSelections([
-				"node",
-				"pi",
-				"--model",
-				`openrouter/acme:model/v1.2+fast@2026-09-01:${level}`,
-			]),
-			{ model: true, thinking: true },
-		);
 	}
+	assert.deepEqual(
+		explicitCliSelections([
+			"node",
+			"pi",
+			"--model",
+			"openrouter/acme:model/v1.2+fast@2026-09-01:high",
+		]),
+		{ model: true, thinking: false },
+		"a model suffix cannot be classified until the session catalog is available",
+	);
 	assert.deepEqual(
 		explicitCliSelections(["node", "pi", "--thinking", "invalid"]),
 		{ model: false, thinking: false },
@@ -3094,36 +3095,67 @@ test("explicit CLI model wins over remembered startup state and is not remembere
 	assert.equal(t.readState().lastUserThinkingLevel, "low");
 });
 
-test("explicit CLI thinking survives a startup fallback before agent_start", async (suite) => {
-	const model = "missing.provider/acme:model/v1.2+fast@2026-09-01";
-	for (const { name, cliArgs } of [
-		{ name: "model shorthand", cliArgs: ["--model", `${model}:high`] },
+test("explicit CLI model thinking is catalog-resolved before startup fallback", async (suite) => {
+	const provider = "openai-codex";
+	const base = "acme:model/v1.2+fast@2026-09-01";
+	for (const scenario of [
 		{
-			name: "standalone thinking precedence",
-			cliArgs: ["--thinking", "high", "--model", `${model}:low`],
+			name: "a complete real model ID ending in :high wins",
+			models: [`${base}:high`],
+			currentId: `${base}:high`,
+			cliArgs: ["--model", `${provider}/${base}:high`],
+			expectedThinking: "low",
+		},
+		{
+			name: "a valid suffix applies when the stripped model resolves",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--model", `${provider}/${base}:high`],
+			expectedThinking: "high",
+		},
+		{
+			name: "a valid suffix does not apply to an unmatched base",
+			models: ["another-model"],
+			currentId: base,
+			cliArgs: ["--model", `${provider}/${base}:high`],
+			expectedThinking: "low",
+		},
+		{
+			name: "an invalid suffix is not a thinking override",
+			models: [base],
+			currentId: `${base}:turbo`,
+			cliArgs: ["--model", `${provider}/${base}:turbo`],
+			expectedThinking: "low",
+		},
+		{
+			name: "standalone --thinking takes precedence",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--thinking", "high", "--model", `${provider}/${base}:low`],
+			expectedThinking: "high",
 		},
 	]) {
-		await suite.test(name, async () => {
+		await suite.test(scenario.name, async () => {
 			const t = setup({
 				accounts: {
+					[provider]: { type: "api_key" },
 					anthropic: { type: "oauth", access: "a", refresh: "ar" },
 				},
-				current: {
-					provider: "missing.provider",
-					id: "acme:model/v1.2+fast@2026-09-01",
-				},
-				thinkingLevel: "high",
+				hostCodexModels: scenario.models,
+				current: { provider, id: scenario.currentId },
+				thinkingLevel: "medium",
 				modelSetThinkingLevel: "low",
 				config: { fallbacks: ["anthropic"] },
-				cliArgs,
+				cliArgs: scenario.cliArgs,
 			});
 			await t.fire("session_start", { reason: "startup" });
-			assert.equal(t.ctx.model.provider, "anthropic");
 			assert.equal(
-				t.thinkingLevel(),
-				"high",
-				"the explicit level must survive fallback before agent_start can capture it",
+				t.ctx.model.provider,
+				"anthropic",
+				"the unavailable launch model must fall back before agent_start",
 			);
+			assert.equal(t.thinkingLevel(), scenario.expectedThinking);
+			await t.fire("session_shutdown");
 		});
 	}
 });
@@ -3397,6 +3429,44 @@ test("explicit CLI preference can be replaced by a genuine user model selection"
 		provider: "anthropic",
 		id: "claude-opus-4-8",
 	});
+});
+
+test("manual rotation commands own the model preference after an explicit CLI launch", async (suite) => {
+	for (const command of ["next", "switch anthropic", "best"]) {
+		await suite.test(command, async () => {
+			const t = setup({
+				accounts: {
+					anthropic: { type: "oauth", access: "a", refresh: "ar" },
+					"openai-codex-account-2": {
+						type: "oauth",
+						access: "c",
+						refresh: "cr",
+						accountId: "codex-2",
+					},
+				},
+				current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+				thinkingLevel: "high",
+				cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+				seedState: {
+					stateVersion: 5,
+					lastUserModel: { provider: "alibaba", id: "qwen3.7-max" },
+					lastUserThinkingLevel: "low",
+					lastModelByFamily: { qwen: "qwen3.7-max" },
+					lastSwitches: [],
+				},
+			});
+			await t.fire("session_start", { reason: "startup" });
+			await t.command(command);
+			assert.notEqual(t.ctx.model.provider, "openai-codex-account-2");
+			await t.fire("session_shutdown");
+			assert.deepEqual(t.readState().lastUserModel, t.ctx.model);
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"low",
+				"a manual model choice must not take ownership of thinking",
+			);
+		});
+	}
 });
 
 test("pi-subagents child keeps its explicit launch model and delegates fallback to the parent runner", async () => {

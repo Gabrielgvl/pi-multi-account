@@ -3551,47 +3551,59 @@ export function isSubagentChildProcess(
 	return env[SUBAGENT_CHILD_ENV] === "1";
 }
 
-function parseExplicitCliThinkingLevel(
-	argv: readonly string[] = process.argv,
-): ReasoningLevel | undefined {
-	let modelLevel: ReasoningLevel | undefined;
-	let thinkingLevel: ReasoningLevel | undefined;
+function parseExplicitCliArgs(argv: readonly string[] = process.argv): {
+	model?: string;
+	thinking?: ReasoningLevel;
+} {
+	let model: string | undefined;
+	let thinking: ReasoningLevel | undefined;
 	for (let i = 2; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--") break;
-		if (arg === "--model" && i + 1 < argv.length) {
-			const value = argv[++i];
-			const colon = value.lastIndexOf(":");
-			const suffix = value.slice(colon + 1);
-			modelLevel =
-				colon >= 0 && REASONING_LEVELS.includes(suffix as ReasoningLevel)
-					? (suffix as ReasoningLevel)
-					: undefined;
-		} else if (arg === "--thinking" && i + 1 < argv.length) {
+		if (arg === "--model" && i + 1 < argv.length) model = argv[++i];
+		else if (arg === "--thinking" && i + 1 < argv.length) {
 			const value = argv[++i];
 			if (REASONING_LEVELS.includes(value as ReasoningLevel)) {
-				thinkingLevel = value as ReasoningLevel;
+				thinking = value as ReasoningLevel;
 			}
 		}
 	}
-	return thinkingLevel ?? modelLevel;
+	return { model, thinking };
+}
+
+// Pi checks the complete model pattern before treating its last colon token as thinking.
+// Registration has no session catalog, so reuse Pi's resolver once session_start supplies one.
+async function resolveExplicitCliModelThinkingLevel(
+	pattern: string | undefined,
+	ctx: any,
+): Promise<ReasoningLevel | undefined> {
+	if (!pattern) return undefined;
+	try {
+		const models = ctx?.modelRegistry?.getAll?.() ?? [];
+		const { resolveModelScopeWithDiagnostics } = await import(
+			"@earendil-works/pi-coding-agent"
+		);
+		const { scopedModels } = await resolveModelScopeWithDiagnostics(
+			[pattern],
+			{ getAvailable: async () => models } as any,
+		);
+		const level = scopedModels[0]?.thinkingLevel;
+		return REASONING_LEVELS.includes(level as ReasoningLevel)
+			? (level as ReasoningLevel)
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export function explicitCliSelections(
 	argv: readonly string[] = process.argv,
 ): { model: boolean; thinking: boolean } {
-	let model = false;
-	for (let i = 2; i < argv.length; i++) {
-		const arg = argv[i];
-		if (arg === "--") break;
-		if (arg === "--model" && i + 1 < argv.length) {
-			model = true;
-			i++;
-		} else if (arg === "--thinking" && i + 1 < argv.length) {
-			i++;
-		}
-	}
-	return { model, thinking: parseExplicitCliThinkingLevel(argv) !== undefined };
+	const parsed = parseExplicitCliArgs(argv);
+	return {
+		model: parsed.model !== undefined,
+		thinking: parsed.thinking !== undefined,
+	};
 }
 
 export default function piMultiAccount(pi: ExtensionAPI) {
@@ -3603,8 +3615,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	const subagentChild = isSubagentChildProcess();
-	const explicitCli = explicitCliSelections();
-	const explicitCliThinkingAtRegistration = parseExplicitCliThinkingLevel();
+	const explicitCliArgs = parseExplicitCliArgs();
+	const explicitCli = {
+		model: explicitCliArgs.model !== undefined,
+		thinking: explicitCliArgs.thinking !== undefined,
+	};
+	const explicitCliModelAtRegistration = explicitCliArgs.model;
+	const explicitCliThinkingAtRegistration = explicitCliArgs.thinking;
 	const hasExplicitCliSelection = explicitCli.model || explicitCli.thinking;
 	// A CLI launch owns both remembered dimensions until a genuine user change takes ownership
 	// of that dimension. Otherwise a model-only launch can persist its thinking clamp (or vice versa).
@@ -6748,6 +6765,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				markExhausted(fallback.provider, config.transientCooldownMs);
 				failedProviders.add(fallback.provider);
 				continue;
+			}
+			if (options.manual) {
+				modelPreferenceChanged = true;
+				rememberUserModel(ctx.model ?? fallback);
 			}
 			restoreDesiredThinking(ctx);
 			applyOnlyActiveFilter(ctx, fallback.provider);
@@ -10353,6 +10374,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		pendingInternalThinkingChanges.length = 0;
 		activeInternalThinkingChange = undefined;
 		modelCatalogContext = ctx;
+		if (!explicitCliThinkingLevel) {
+			const resolved = await resolveExplicitCliModelThinkingLevel(
+				explicitCliModelAtRegistration,
+				ctx,
+			);
+			if (resolved) {
+				explicitCli.thinking = true;
+				explicitCliThinkingLevel = resolved;
+				desiredThinkingLevel = resolved;
+			}
+		}
 		if (!subagentChild) preflightHostCapabilities(ctx);
 		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
 		// published them rather than the version our own slot provisioning has just rewritten.
