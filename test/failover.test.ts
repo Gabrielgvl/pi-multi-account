@@ -420,7 +420,10 @@ function setup(opts: {
 	const events: Record<string, Array<(event: any, ctx?: any) => any>> = {};
 	const busEvents = new Map<string, Array<(payload: any) => void>>();
 	const commands: Record<string, (args: string, ctx: any) => any> = {};
-	const pendingThinkingLevelSelects: Promise<void>[] = [];
+	const pendingThinkingLevelSelects: Array<{
+		delivery: Promise<void>;
+		release?: () => void;
+	}> = [];
 
 	const ctx: any = {
 		model: opts.current
@@ -532,12 +535,18 @@ function setup(opts: {
 		payload: { level: string; previousLevel: string },
 		delayed = opts.thinkingLevelSelectDelivery === "delayed",
 	) => {
+		let release: (() => void) | undefined;
+		const gate = delayed
+			? new Promise<void>((resolve) => {
+					release = resolve;
+				})
+			: undefined;
 		const delivery = (async () => {
-			if (delayed) await Promise.resolve();
+			if (gate) await gate;
 			for (const handler of events.thinking_level_select ?? [])
 				await handler(payload, ctx);
 		})();
-		pendingThinkingLevelSelects.push(delivery);
+		pendingThinkingLevelSelects.push({ delivery, release });
 		return delivery;
 	};
 
@@ -725,8 +734,11 @@ function setup(opts: {
 		sessionThinkingLevel = clampThinking(level);
 	};
 	const settleThinkingLevelSelects = async () => {
-		while (pendingThinkingLevelSelects.length > 0)
-			await Promise.all(pendingThinkingLevelSelects.splice(0));
+		while (pendingThinkingLevelSelects.length > 0) {
+			const pending = pendingThinkingLevelSelects.splice(0);
+			for (const item of pending) item.release?.();
+			await Promise.all(pending.map((item) => item.delivery));
+		}
 	};
 
 	return {
@@ -3114,11 +3126,18 @@ test("explicit CLI model thinking is catalog-resolved before startup fallback", 
 			expectedThinking: "high",
 		},
 		{
-			name: "a valid suffix does not apply to an unmatched base",
-			models: ["another-model"],
-			currentId: base,
-			cliArgs: ["--model", `${provider}/${base}:high`],
-			expectedThinking: "low",
+			name: "a valid suffix applies to a recognized-provider custom model",
+			models: [base],
+			currentId: "future-model",
+			cliArgs: ["--model", `${provider}/future-model:high`],
+			expectedThinking: "high",
+		},
+		{
+			name: "--provider custom model shorthand follows the same resolution",
+			models: [base],
+			currentId: "future-model",
+			cliArgs: ["--provider", provider, "--model", "future-model:high"],
+			expectedThinking: "high",
 		},
 		{
 			name: "an invalid suffix is not a thinking override",
@@ -3132,6 +3151,13 @@ test("explicit CLI model thinking is catalog-resolved before startup fallback", 
 			models: [base],
 			currentId: base,
 			cliArgs: ["--thinking", "high", "--model", `${provider}/${base}:low`],
+			expectedThinking: "high",
+		},
+		{
+			name: "invalid standalone --thinking does not suppress model shorthand",
+			models: [base],
+			currentId: base,
+			cliArgs: ["--thinking", "invalid", "--model", `${provider}/${base}:high`],
 			expectedThinking: "high",
 		},
 	]) {
@@ -3224,7 +3250,6 @@ test("internal thinking restores do not become explicit CLI intent", async (suit
 				},
 			});
 			await t.fire("session_start", { reason: "startup" });
-			await t.settleThinkingLevelSelects();
 			assert.equal(t.thinkingLevel(), "high");
 			assert.equal(
 				t.readState().lastUserThinkingLevel,
@@ -3232,7 +3257,7 @@ test("internal thinking restores do not become explicit CLI intent", async (suit
 				"the extension's own restore must not persist the one-shot CLI level",
 			);
 
-			// Recreate the exact low -> high event key after the internal event was consumed.
+			// For delayed delivery, make the genuine identical low -> high transition arrive first.
 			t.userSetsThinking("low");
 			await t.fire("thinking_level_select", {
 				level: "low",
@@ -3243,6 +3268,12 @@ test("internal thinking restores do not become explicit CLI intent", async (suit
 				level: "high",
 				previousLevel: "low",
 			});
+			assert.equal(
+				t.readState().lastUserThinkingLevel,
+				"high",
+				"the genuine identical choice must be recorded before delayed internal delivery",
+			);
+			await t.settleThinkingLevelSelects();
 			await t.fire("session_shutdown");
 			assert.equal(
 				t.readState().lastUserThinkingLevel,
