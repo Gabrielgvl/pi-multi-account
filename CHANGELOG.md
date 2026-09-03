@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ollama Cloud now shows its real session and weekly quota instead of claiming that no API exists.** The extension still reads plan and suspension metadata from `/api/me`, then best-effort fetches the live fractional windows from `GET /api/usage`. Because that endpoint and its fixed reset epochs are not yet a stable documented contract, any failure falls back to the plan-only status and inferred reset times remain forecasts subject to the normal recheck ceiling; they never turn a stale estimate into a permanent routing veto.
+
 - **Different Codex users in one Team/Business workspace can occupy separate rotation slots.** Pi stores `chatgpt_account_id`, which identifies the selected workspace rather than the user membership inside it. Deduplicating on that value rejected the second login as the same “real account” and also shared cooldowns between distinct users. Codex identity now prefers the JWT's stable `chatgpt_account_user_id` claim; tokens without it use the documented `chatgpt_user_id` plus workspace id before falling back to the legacy stored `accountId`. Re-login detection uses the same identity, so a refreshed token keeps its cooldown while replacing a slot with another user in the same workspace clears the previous user's state.
 
 - **The Anthropic OAuth billing header now identifies Claude Code `2.1.259`.** This replaces the stale `2.1.241` client version reported in #29.
