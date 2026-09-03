@@ -442,13 +442,16 @@ import {
 } from "./model-catalog.ts";
 import {
 	fetchUsageSnapshot,
+	formatResetDuration,
 	formatUsageCompact,
 	formatUsageDetails,
 	parseCodexUsageHeaders,
 	providerUsageLabel,
+	remainingPercent,
 	usageColor,
 	usageFamily,
 	UsageFetchError,
+	windowLabel,
 	type UsageSnapshot,
 	type UsageWindow,
 } from "./usage.ts";
@@ -5005,8 +5008,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		ctx: any,
 		provider = ctx?.model?.provider,
 		force = false,
+		allowWhenHidden = false,
 	): Promise<UsageSnapshot | undefined> {
-		if (!config.showUsage || !provider || !usageFamily(provider)) {
+		if ((!config.showUsage && !allowWhenHidden) || !provider || !usageFamily(provider)) {
 			updateUsageStatus(ctx, provider);
 			return undefined;
 		}
@@ -5072,6 +5076,77 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			providers.map((provider) => refreshUsage(ctx, provider, force)),
 		);
 		updateUsageStatus(ctx);
+	}
+
+	function accountUsageCell(
+		snapshot: UsageSnapshot | undefined,
+		position: "primary" | "secondary",
+		now: number,
+	): string {
+		const window = snapshot?.[position];
+		if (!snapshot || !window) return "—";
+		return `${windowLabel(window, snapshot.family, position)} ${remainingPercent(window)}%/${formatResetDuration(window.resetAt, now)}`;
+	}
+
+	function renderAccountTable(ctx: any): string {
+		refreshDiscovery(false, ctx);
+		const auth = readAuthFile();
+		const ordered = [
+			...rotation,
+			...Object.keys(auth)
+				.filter((provider) => !rotation.includes(provider))
+				.sort((a, b) => a.localeCompare(b)),
+		];
+		const duplicateOf = new Map(
+			duplicateSlots.map(({ duplicate, primary }) => [duplicate, primary]),
+		);
+		const unconfigured = new Set(unconfiguredRotationMembers(ctx));
+		const now = Date.now();
+		const rows = ordered.map((provider) => {
+			const entry = auth[provider];
+			const snapshot = cachedUsage(provider);
+			const account = snapshot?.account ?? "—";
+			const alias =
+				snapshot?.account && snapshot.account.includes("@")
+					? snapshot.account.slice(0, snapshot.account.indexOf("@"))
+					: snapshot?.account ?? "—";
+			const duplicate = duplicateOf.get(provider);
+			const recoveryAt = providerRecoveryAt(provider, now);
+			let status: string;
+			if (!entry || !isEntryUsable(entry)) status = "unavailable · no credential";
+			else if (isInvalidated(provider)) status = "unavailable · re-login";
+			else if (duplicate) status = `duplicate → ${duplicate}`;
+			else if (unconfigured.has(provider)) status = "unavailable · no models";
+			else if (recoveryAt > now)
+				status = `cooldown ${formatResetDuration(recoveryAt, now)}`;
+			else if (usageErrors.has(provider)) status = "ready · usage unavailable";
+			else status = "ready";
+			return [
+				provider,
+				alias,
+				account,
+				snapshot?.plan ?? "—",
+				accountUsageCell(snapshot, "primary", now),
+				accountUsageCell(snapshot, "secondary", now),
+				status,
+			];
+		});
+		if (rows.length === 0) {
+			return "pi-multi-account accounts: no configured accounts in auth.json";
+		}
+		const header = ["Slot", "Alias", "Account", "Plan", "Primary", "Secondary", "Status"];
+		const widths = header.map((title, column) =>
+			Math.max(title.length, ...rows.map((row) => row[column].length)),
+		);
+		const line = (row: string[]) =>
+			row.map((cell, column) => cell.padEnd(widths[column])).join("  ").trimEnd();
+		return [
+			"pi-multi-account accounts — provider metadata only; — = not reported",
+			line(header),
+			line(widths.map((width) => "-".repeat(width))),
+			...rows.map(line),
+			"Use /multi-account accounts refresh to refresh every supported account explicitly.",
+		].join("\n");
 	}
 
 	function clearUsageStatusTimer() {
@@ -8600,6 +8675,35 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			);
 			return;
 		}
+		if (command === "accounts" || command === "account") {
+			if (arg1 && arg1 !== "refresh") {
+				ctx.ui.notify(
+					"pi-multi-account: usage: /multi-account accounts [refresh]",
+					"warning",
+				);
+				return;
+			}
+			if (arg1 === "refresh") {
+				refreshDiscovery(false, ctx);
+				const auth = readAuthFile();
+				const duplicates = new Set(
+					duplicateSlots.map(({ duplicate }) => duplicate),
+				);
+				const providers = Object.entries(auth)
+					.filter(
+						([provider, entry]) =>
+							!!usageFamily(provider) &&
+							isEntryUsable(entry) &&
+							!duplicates.has(provider),
+					)
+					.map(([provider]) => provider);
+				await Promise.all(
+					providers.map((provider) => refreshUsage(ctx, provider, true, true)),
+				);
+			}
+			ctx.ui.notify(renderAccountTable(ctx), "info");
+			return;
+		}
 		if (command === "limits" || command === "usage" || command === "quota") {
 			const provider = ctx.model?.provider;
 			if (!provider || !usageFamily(provider)) {
@@ -9066,7 +9170,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// list below, `switch` was effectively undiscoverable and `next` pressed repeatedly
 				// was the only way anyone found to reach a chosen account.
 				`Switch accounts: /multi-account best — jump straight to an account that can work now · /multi-account switch <provider> — e.g. /multi-account switch ${rotation.find((p) => p !== ctx.model?.provider) ?? rotation[0] ?? "<provider>"} · /multi-account next steps through the rotation in order`,
-				`Other commands: status | best | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
+				`Other commands: status | accounts [refresh] | best | priority [...] | limits [refresh] | models | log [N|on|off] | only-active [on|off] | rediscover | add [anthropic|codex|kimi|cursor|ollama|qwen] | remove [anthropic|codex|kimi|cursor|ollama|qwen|<provider-id>] | revive <provider|all> | clear | stop | reset | reload | enable | disable`,
 			].join("\n"),
 			"info",
 		);

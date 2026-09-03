@@ -6074,6 +6074,108 @@ test("status shows how to switch to a specific account, not just next", async ()
 	);
 });
 
+test("accounts lists provider identity, quota and routing state without credentials", async () => {
+	const now = Date.now();
+	const accounts: Account = {
+		anthropic: { type: "oauth", access: "anthropic-secret", refresh: "anthropic-refresh" },
+		"openai-codex-account-2": {
+			type: "oauth",
+			access: "codex-secret",
+			refresh: "codex-refresh",
+			accountId: "workspace-safe-id",
+		},
+	};
+	const t = setup({
+		accounts,
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: {
+				"openai-codex-account-2": now + 30 * 60_000,
+			},
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				"openai-codex-account-2": {
+					provider: "openai-codex-account-2",
+					family: "codex",
+					fetchedAt: now,
+					account: "alice@example.com",
+					plan: "plus",
+					serviceable: false,
+					primary: {
+						usedPercent: 20,
+						resetAt: now + 60 * 60_000,
+						windowSeconds: 18_000,
+					},
+					secondary: {
+						usedPercent: 50,
+						resetAt: now + 2 * 86_400_000,
+						windowSeconds: 604_800,
+					},
+				},
+			},
+			lastSwitches: [],
+		},
+	});
+
+	await t.command("accounts");
+	const table = t.rec.notifies.at(-1) ?? "";
+	assert.match(table, /Slot\s+Alias\s+Account\s+Plan\s+Primary\s+Secondary\s+Status/);
+	assert.match(table, /openai-codex-account-2\s+alice\s+alice@example\.com\s+plus/);
+	assert.match(table, /5h 80%/);
+	assert.match(table, /7d 50%/);
+	assert.match(table, /cooldown \d+m/);
+	assert.match(table, /\banthropic\b[\s\S]*\bready\b/);
+	assert.doesNotMatch(table, /anthropic-secret|anthropic-refresh|codex-secret|codex-refresh|workspace-safe-id/);
+});
+
+test("accounts refresh explicitly loads every supported account while the footer is disabled", async () => {
+	const originalFetch = globalThis.fetch;
+	let authorization = "";
+	globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+		authorization = new Headers(init?.headers).get("Authorization") ?? "";
+		return new Response(
+			JSON.stringify({
+				plan_type: "plus",
+				email: "bob@example.com",
+				rate_limit: {
+					allowed: true,
+					primary_window: {
+						used_percent: 25,
+						limit_window_seconds: 18_000,
+						reset_at: Math.floor(Date.now() / 1000) + 3600,
+					},
+				},
+			}),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+	try {
+		const t = setup({
+			accounts: {
+				"openai-codex": {
+					type: "oauth",
+					access: "refresh-only-secret",
+					refresh: "refresh-only-token",
+					accountId: "workspace-id",
+				},
+			},
+			current: { provider: "openai-codex", id: "gpt-5.5" },
+			config: { showUsage: false },
+		});
+		await t.command("accounts refresh");
+		const table = t.rec.notifies.at(-1) ?? "";
+		assert.equal(authorization, "Bearer refresh-only-secret");
+		assert.match(table, /bob\s+bob@example\.com\s+plus/);
+		assert.match(table, /5h 75%/);
+		assert.doesNotMatch(table, /refresh-only-secret|refresh-only-token|workspace-id/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 // ---------------------------------------------------------------------------
 // Providers outside the five specially-managed families
 // ---------------------------------------------------------------------------
