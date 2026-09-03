@@ -122,6 +122,16 @@ test("explicit CLI selection detection follows Pi option parsing", () => {
 		explicitCliSelections(["node", "pi", "--model", "openai/gpt-5.5", "--thinking", "high"]),
 		{ model: true, thinking: true },
 	);
+	for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+		assert.equal(
+			explicitCliSelections(["node", "pi", "--thinking", level]).thinking,
+			true,
+		);
+	}
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--thinking", "invalid"]),
+		{ model: false, thinking: false },
+	);
 	assert.deepEqual(
 		explicitCliSelections(["node", "pi", "--", "--model", "openai/gpt-5.5"]),
 		{ model: false, thinking: false },
@@ -264,6 +274,8 @@ function setup(opts: {
 	unknownProviders?: string[];
 	/** The level the SESSION runs at (what `--thinking` / `/thinking` produced). */
 	thinkingLevel?: string;
+	/** Thinking level Pi applies while changing models, before model_select is emitted. */
+	modelSetThinkingLevel?: string;
 	/** Highest thinking level a provider's models support — Pi clamps anything above it. */
 	thinkingCaps?: Record<string, string>;
 	/** Pi settings.json defaultProvider/defaultModel, used after catalog load. */
@@ -526,8 +538,16 @@ function setup(opts: {
 			rec.setModels.push(target);
 			if (opts.setModelFailures?.includes(target)) return false;
 			ctx.model = mkModel(model.provider, model.id);
-			// Pi re-clamps (and persists) the thinking level for the new model's capabilities.
-			sessionThinkingLevel = clampThinking(sessionThinkingLevel);
+			// Pi applies a model default/clamp before emitting model_select.
+			const previousThinkingLevel = sessionThinkingLevel;
+			sessionThinkingLevel = opts.modelSetThinkingLevel ?? clampThinking(sessionThinkingLevel);
+			if (sessionThinkingLevel !== previousThinkingLevel) {
+				for (const handler of events.thinking_level_select ?? [])
+					await handler(
+						{ level: sessionThinkingLevel, previousLevel: previousThinkingLevel },
+						ctx,
+					);
+			}
 			for (const handler of events.model_select ?? [])
 				await handler({ model: ctx.model, previousModel, source: "set" }, ctx);
 			return true;
@@ -616,6 +636,8 @@ function setup(opts: {
 	const setCurrent = (provider: string, id: string) => {
 		ctx.model = mkModel(provider, id);
 	};
+	const setModel = (provider: string, id: string) =>
+		pi.setModel(mkModel(provider, id));
 	const readState = () => {
 		try {
 			return JSON.parse(readFileSync(STATE, "utf8"));
@@ -650,6 +672,7 @@ function setup(opts: {
 		fire,
 		setIdle,
 		setCurrent,
+		setModel,
 		readState,
 		beforeReq,
 		command,
@@ -2946,10 +2969,13 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 			cursor: { type: "oauth", access: "c", refresh: "cr" },
 		},
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+		modelSetThinkingLevel: "low",
 		config: { includeCursor: true, fallbacks: ["anthropic", "cursor"] },
 		seedState: {
 			stateVersion: 5,
 			lastUserModel: { provider: "cursor", id: "cursor-grok-4.6" },
+			lastUserThinkingLevel: "high",
 			lastModelByFamily: { cursor: "cursor-grok-4.6" },
 			exhaustedUntilByProvider: {},
 			lastProbeAtByProvider: {},
@@ -2963,6 +2989,7 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 		{ provider: "cursor", id: "cursor-grok-4.6" },
 		`startup must put the session back on the last live model, not Pi's anthropic default; setModels=${t.rec.setModels.join(",")}`,
 	);
+	assert.equal(t.thinkingLevel(), "high");
 	uninstallCursorProvider();
 });
 
@@ -3017,6 +3044,7 @@ test("explicit CLI thinking wins while ordinary model restoration remains enable
 		},
 		current: { provider: "anthropic", id: "claude-opus-4-8" },
 		thinkingLevel: "high",
+		modelSetThinkingLevel: "low",
 		config: { enabled: false },
 		cliArgs: ["--thinking", "high"],
 		seedState: {
@@ -3025,7 +3053,7 @@ test("explicit CLI thinking wins while ordinary model restoration remains enable
 				provider: "openai-codex-account-2",
 				id: "gpt-5.5",
 			},
-			lastUserThinkingLevel: "low",
+			lastUserThinkingLevel: "medium",
 			lastModelByFamily: { "openai-codex": "gpt-5.5" },
 			lastSwitches: [],
 		},
@@ -3036,9 +3064,86 @@ test("explicit CLI thinking wins while ordinary model restoration remains enable
 		id: "gpt-5.5",
 	});
 	assert.equal(t.thinkingLevel(), "high");
-	assert.deepEqual(t.rec.thinkingLevels, []);
+	assert.deepEqual(t.rec.thinkingLevels, ["high"]);
+	await t.setModel("anthropic", "claude-opus-4-8");
 	await t.fire("session_shutdown");
-	assert.equal(t.readState().lastUserThinkingLevel, "low");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "medium");
+});
+
+test("explicit CLI model keeps a native model thinking reset out of remembered state", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		modelSetThinkingLevel: "low",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "high",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	await t.setModel("anthropic", "claude-opus-4-8");
+	assert.equal(t.thinkingLevel(), "low");
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "high");
+});
+
+test("explicit CLI model can be replaced by a genuine thinking selection only", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	t.userSetsThinking("medium");
+	await t.fire("thinking_level_select", {
+		level: "medium",
+		previousLevel: "high",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "medium");
 });
 
 test("no-session explicit launch neither restores nor overwrites the global preference", async () => {

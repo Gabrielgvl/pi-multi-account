@@ -3551,11 +3551,29 @@ export function isSubagentChildProcess(
 	return env[SUBAGENT_CHILD_ENV] === "1";
 }
 
+function parseExplicitCliThinkingLevel(
+	argv: readonly string[] = process.argv,
+): ReasoningLevel | undefined {
+	let level: ReasoningLevel | undefined;
+	for (let i = 2; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--") break;
+		if (arg === "--model" || arg === "--thinking") {
+			if (i + 1 < argv.length) {
+				const value = argv[++i];
+				if (arg === "--thinking" && REASONING_LEVELS.includes(value as ReasoningLevel)) {
+					level = value as ReasoningLevel;
+				}
+			}
+		}
+	}
+	return level;
+}
+
 export function explicitCliSelections(
 	argv: readonly string[] = process.argv,
 ): { model: boolean; thinking: boolean } {
 	let model = false;
-	let thinking = false;
 	for (let i = 2; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--") break;
@@ -3563,11 +3581,10 @@ export function explicitCliSelections(
 			model = true;
 			i++;
 		} else if (arg === "--thinking" && i + 1 < argv.length) {
-			thinking = true;
 			i++;
 		}
 	}
-	return { model, thinking };
+	return { model, thinking: parseExplicitCliThinkingLevel(argv) !== undefined };
 }
 
 export default function piMultiAccount(pi: ExtensionAPI) {
@@ -3580,8 +3597,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	const subagentChild = isSubagentChildProcess();
 	const explicitCli = explicitCliSelections();
+	const explicitCliThinkingAtRegistration = parseExplicitCliThinkingLevel();
 	const hasExplicitCliSelection = explicitCli.model || explicitCli.thinking;
-	let explicitCliSelectionChanged = !hasExplicitCliSelection;
+	// A CLI launch owns both remembered dimensions until a genuine user change takes ownership
+	// of that dimension. Otherwise a model-only launch can persist its thinking clamp (or vice versa).
+	let modelPreferenceChanged = !hasExplicitCliSelection;
+	let thinkingPreferenceChanged = !hasExplicitCliSelection;
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild;
@@ -4010,6 +4031,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	let lastLeftProvider: string | undefined; // account we just failed away from (anti-ping-pong)
 	let lastLeftAt = 0;
 	let automaticModelTarget: ModelRef | undefined;
+	let lastObservedModelKey: string | undefined;
+	let pendingModelThinkingChange: { model: string; level: ReasoningLevel } | undefined;
 	// Forward-progress watchdog state. A "resume in flight" is a continuation WE dispatched
 	// (pi.continueAgent after a switch) whose new turn must keep showing activity. Any stream
 	// token, tool event, or provider response is "progress" and disarms the stuck timer; total
@@ -4058,9 +4081,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// forcing config.reasoningLevel on every agent_start clobbered per-agent thinking, so an
 	// agent configured `low` was flipped to `high` on its first turn (issue #6).
 	let desiredThinkingLevel: ReasoningLevel | undefined;
-	// What the host clamped our level down to, and on which model. A clamp is the fallback
-	// model's cap, NOT a user decision — it must never become the new intent, otherwise one
-	// failover to a weaker model would ratchet thinking down for the rest of the session.
+	let explicitCliThinkingLevel: ReasoningLevel | undefined = explicitCliThinkingAtRegistration;
+	// What the host applied after we asserted the session's intent, and on which model. A
+	// capability clamp or model default is NOT a user decision, otherwise thinking ratchets.
 	let thinkingClamp: { model: string; level: ReasoningLevel } | undefined;
 
 	const thinkingRank = (level: unknown) =>
@@ -4076,6 +4099,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
+	if (explicitCli.thinking && !explicitCliThinkingLevel)
+		explicitCliThinkingLevel = readThinkingLevel();
+
 	const thinkingModelKey = (ctx?: any) =>
 		ctx?.model?.provider && ctx?.model?.id
 			? ref(ctx.model.provider, ctx.model.id)
@@ -4088,7 +4114,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			!!thinkingClamp &&
 			thinkingClamp.level === level &&
 			thinkingClamp.model === thinkingModelKey(ctx) &&
-			thinkingRank(level) < thinkingRank(desiredThinkingLevel)
+			level !== desiredThinkingLevel
 		);
 	}
 
@@ -6805,15 +6831,23 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			subagentChild ||
 			!model?.provider ||
 			!model?.id ||
-			(hasExplicitCliSelection && !explicitCliSelectionChanged)
+			(!modelPreferenceChanged && !thinkingPreferenceChanged)
 		)
 			return;
-		const family = classifyProvider(model.provider, config.qwenProvider);
-		if (family) lastModelByFamily[family] = model.id;
+		const rememberedModel = modelPreferenceChanged
+			? { provider: model.provider, id: model.id }
+			: persistedState.lastUserModel;
+		if (!rememberedModel?.provider || !rememberedModel.id) return;
+		if (modelPreferenceChanged) {
+			const family = classifyProvider(model.provider, config.qwenProvider);
+			if (family) lastModelByFamily[family] = model.id;
+		}
 		persist(
 			{
-				lastUserModel: { provider: model.provider, id: model.id },
-				lastUserThinkingLevel: desiredThinkingLevel ?? readThinkingLevel(),
+				lastUserModel: rememberedModel,
+				lastUserThinkingLevel: thinkingPreferenceChanged
+					? desiredThinkingLevel ?? readThinkingLevel()
+					: persistedState.lastUserThinkingLevel,
 				lastModelByFamily: { ...lastModelByFamily },
 			},
 			{ writeUserPreferences: true },
@@ -6835,6 +6869,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			logEvent("remembered_model_skipped", { reason: "explicit CLI model" });
 			return false;
 		}
+		const cliThinkingLevel = explicitCli.thinking
+			? (explicitCliThinkingLevel ?? readThinkingLevel())
+			: undefined;
 		const intended = intendedStartupModel();
 		if (!intended) {
 			logEvent("remembered_model_skipped", { reason: "no intended model" });
@@ -6844,7 +6881,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.model?.provider === intended.provider &&
 			ctx.model?.id === intended.id;
 		if (alreadyThere) {
-			if (!explicitCli.thinking) restoreDesiredThinking(ctx);
+			if (explicitCli.thinking) desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
+			restoreDesiredThinking(ctx);
 			return true;
 		}
 		if (cursorReady) {
@@ -6868,6 +6906,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				? ref(ctx.model.provider, ctx.model.id)
 				: "none";
 		const to = ref(intended.provider, intended.id);
+		if (explicitCli.thinking) {
+			desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
+		} else {
+			const rememberedLevel = persistedState.lastUserThinkingLevel;
+			if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+		}
 		automaticModelTarget = to;
 		let ok = false;
 		try {
@@ -6883,15 +6927,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			source: persistedState.lastUserModel ? "state" : "settings",
 		});
 		if (ok) {
-			// Restore the user's level too — Pi clamped it to the fallback model's caps
-			// while creating the session.
-			if (!explicitCli.thinking) {
+			// Pi resets thinking while changing models. Re-assert either the explicit CLI level
+			// captured before that reset or the ordinary remembered level.
+			if (explicitCli.thinking) {
+				desiredThinkingLevel = cliThinkingLevel ?? desiredThinkingLevel;
+			} else {
 				const rememberedLevel = persistedState.lastUserThinkingLevel;
-				if (rememberedLevel) {
-					desiredThinkingLevel = rememberedLevel as ReasoningLevel;
-				}
-				restoreDesiredThinking(ctx);
+				if (rememberedLevel) desiredThinkingLevel = rememberedLevel as ReasoningLevel;
 			}
+			restoreDesiredThinking(ctx);
 			ctx.ui?.notify?.(
 				`pi-multi-account: restored ${to} after catalog load (Pi had fallen back to ${from})`,
 				"info",
@@ -10227,6 +10271,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	safeOn("session_start", async (_event, ctx) => {
+		lastObservedModelKey = thinkingModelKey(ctx);
+		pendingModelThinkingChange = undefined;
 		modelCatalogContext = ctx;
 		if (!subagentChild) preflightHostCapabilities(ctx);
 		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
@@ -10591,7 +10637,18 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (subagentChild || internalThinkingChanges > 0) return;
 		const level = (event as any).level;
 		if (thinkingRank(level) < 0) return;
-		if (hasExplicitCliSelection) explicitCliSelectionChanged = true;
+		const modelKey = thinkingModelKey(ctx);
+		// Pi applies a model's thinking default/clamp before it emits model_select. The changed
+		// ctx.model identifies that one event; do not turn it into user intent.
+		if (
+			lastObservedModelKey &&
+			modelKey !== "unknown" &&
+			modelKey !== lastObservedModelKey
+		) {
+			pendingModelThinkingChange = { model: modelKey, level: level as ReasoningLevel };
+			return;
+		}
+		thinkingPreferenceChanged = true;
 		desiredThinkingLevel = level as ReasoningLevel;
 		thinkingClamp = undefined;
 		rememberUserModel(ctx?.model);
@@ -10608,13 +10665,19 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			refreshUsage(ctx, model.provider),
 		);
 		const selected = ref(model.provider, model.id);
+		const pendingThinking = pendingModelThinkingChange;
+		pendingModelThinkingChange = undefined;
+		lastObservedModelKey = selected;
+		if (pendingThinking?.model === selected) {
+			thinkingClamp = pendingThinking;
+		}
 		if (automaticModelTarget === selected) {
 			automaticModelTarget = undefined;
 			rememberUserModel(model);
 			return;
 		}
 		if ((event as any).source === "restore") return;
-		explicitCliSelectionChanged = true;
+		modelPreferenceChanged = true;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
