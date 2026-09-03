@@ -88,6 +88,7 @@ function uninstallCursorProvider() {
 
 const {
 	default: piMultiAccount,
+	explicitCliSelections,
 	canPersistRefreshedCredentials,
 	mergeRefreshedCredentials,
 	modelIdentityKey,
@@ -95,6 +96,9 @@ const {
 	sameModelIdentity,
 } = (await import("../index.ts")) as {
 	default: (pi: any) => void;
+	explicitCliSelections: (
+		argv?: readonly string[],
+	) => { model: boolean; thinking: boolean };
 	canPersistRefreshedCredentials: (
 		authStorage: any,
 		authWritable?: () => boolean,
@@ -112,6 +116,21 @@ const {
 	) => Promise<boolean>;
 	sameModelIdentity: (a: string | undefined, b: string | undefined) => boolean;
 };
+
+test("explicit CLI selection detection follows Pi option parsing", () => {
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--model", "openai/gpt-5.5", "--thinking", "high"]),
+		{ model: true, thinking: true },
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--", "--model", "openai/gpt-5.5"]),
+		{ model: false, thinking: false },
+	);
+	assert.deepEqual(
+		explicitCliSelections(["node", "pi", "--models", "openai/*"]),
+		{ model: false, thinking: false },
+	);
+});
 
 test("model identity folds Cursor effort suffixes and the cursor- prefix", () => {
 	assert.equal(modelIdentityKey("cursor-grok-4.6-high"), "grok-4.6");
@@ -251,6 +270,8 @@ function setup(opts: {
 	settings?: { defaultProvider: string; defaultModel: string };
 	/** Simulate a child process launched by pi-subagents. */
 	subagentChild?: boolean;
+	/** Simulate Pi CLI arguments before the extension is loaded. */
+	cliArgs?: string[];
 	/**
 	 * Shape of the host's AuthStorage.
 	 *
@@ -540,11 +561,14 @@ function setup(opts: {
 	(pi as any).__testCompactFn = opts.compactFn;
 
 	const previousSubagentChild = process.env.PI_SUBAGENT_CHILD;
+	const previousArgv = process.argv;
 	if (opts.subagentChild) process.env.PI_SUBAGENT_CHILD = "1";
 	else delete process.env.PI_SUBAGENT_CHILD;
+	process.argv = ["node", "pi", ...(opts.cliArgs ?? [])];
 	try {
 		piMultiAccount(pi);
 	} finally {
+		process.argv = previousArgv;
 		if (previousSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previousSubagentChild;
 	}
@@ -2940,6 +2964,160 @@ test("session_start restores lastUserModel after Pi falls back to anthropic/clau
 		`startup must put the session back on the last live model, not Pi's anthropic default; setModels=${t.rec.setModels.join(",")}`,
 	);
 	uninstallCursorProvider();
+});
+
+test("explicit CLI model wins over remembered startup state and is not remembered on shutdown", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	assert.equal(t.thinkingLevel(), "high");
+	assert.ok(!t.rec.notifies.some((message) => message.includes("restored")));
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "low");
+});
+
+test("explicit CLI thinking wins while ordinary model restoration remains enabled", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--thinking", "high"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: {
+				provider: "openai-codex-account-2",
+				id: "gpt-5.5",
+			},
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { "openai-codex": "gpt-5.5" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	assert.equal(t.thinkingLevel(), "high");
+	assert.deepEqual(t.rec.thinkingLevels, []);
+	await t.fire("session_shutdown");
+	assert.equal(t.readState().lastUserThinkingLevel, "low");
+});
+
+test("no-session explicit launch neither restores nor overwrites the global preference", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: [
+			"--no-session",
+			"--model",
+			"openai-codex-account-2/gpt-5.5",
+			"--thinking",
+			"high",
+		],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.5",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
+	assert.equal(t.readState().lastUserThinkingLevel, "low");
+});
+
+test("explicit CLI preference can be replaced by a genuine user model selection", async () => {
+	const t = setup({
+		accounts: {
+			anthropic: { type: "oauth", access: "a", refresh: "ar" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c",
+				refresh: "cr",
+				accountId: "codex-2",
+			},
+		},
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		thinkingLevel: "high",
+		config: { enabled: false },
+		cliArgs: ["--model", "openai-codex-account-2/gpt-5.5"],
+		seedState: {
+			stateVersion: 5,
+			lastUserModel: { provider: "anthropic", id: "claude-opus-4-8" },
+			lastUserThinkingLevel: "low",
+			lastModelByFamily: { anthropic: "claude-opus-4-8" },
+			lastSwitches: [],
+		},
+	});
+	await t.fire("session_start", { reason: "startup" });
+	t.setCurrent("anthropic", "claude-opus-4-8");
+	await t.fire("model_select", {
+		model: { provider: "anthropic", id: "claude-opus-4-8" },
+		previousModel: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		source: "set",
+	});
+	await t.fire("session_shutdown");
+	assert.deepEqual(t.readState().lastUserModel, {
+		provider: "anthropic",
+		id: "claude-opus-4-8",
+	});
 });
 
 test("pi-subagents child keeps its explicit launch model and delegates fallback to the parent runner", async () => {

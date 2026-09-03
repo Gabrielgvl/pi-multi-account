@@ -3551,6 +3551,25 @@ export function isSubagentChildProcess(
 	return env[SUBAGENT_CHILD_ENV] === "1";
 }
 
+export function explicitCliSelections(
+	argv: readonly string[] = process.argv,
+): { model: boolean; thinking: boolean } {
+	let model = false;
+	let thinking = false;
+	for (let i = 2; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--") break;
+		if (arg === "--model" && i + 1 < argv.length) {
+			model = true;
+			i++;
+		} else if (arg === "--thinking" && i + 1 < argv.length) {
+			thinking = true;
+			i++;
+		}
+	}
+	return { model, thinking };
+}
+
 export default function piMultiAccount(pi: ExtensionAPI) {
 	// Warm up the OAuth helpers before any provider registration: providers are
 	// registered synchronously below and their `usesCallbackServer`/`getApiKey`
@@ -3560,6 +3579,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	const subagentChild = isSubagentChildProcess();
+	const explicitCli = explicitCliSelections();
+	const hasExplicitCliSelection = explicitCli.model || explicitCli.thinking;
+	let explicitCliSelectionChanged = !hasExplicitCliSelection;
 	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild;
@@ -3669,6 +3691,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	/** pi.setModel that first restores the target's models when the filter hid them. */
+	let internalThinkingChanges = 0;
 	async function setModelEnsuringVisible(
 		target: { provider: string; id: string },
 		ctx: any,
@@ -3676,7 +3699,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (onlyActiveModels) unhideProvider(target.provider);
 		// Pi rewrites settings.json on this path; the next turn checks that it actually did.
 		pendingSettingsCheck = true;
-		return pi.setModel(target as any);
+		internalThinkingChanges++;
+		try {
+			return await pi.setModel(target as any);
+		} finally {
+			internalThinkingChanges--;
+		}
 	}
 
 	/**
@@ -4091,10 +4119,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function restoreDesiredThinking(ctx?: any) {
 		if (!desiredThinkingLevel) return;
+		internalThinkingChanges++;
 		try {
 			(pi as any).setThinkingLevel?.(desiredThinkingLevel);
 		} catch {
 			/* setThinkingLevel clamps to model caps; ignore if unsupported */
+		} finally {
+			internalThinkingChanges--;
 		}
 		// Record a clamp so the next turn does not mistake the fallback model's cap for intent.
 		const applied = readThinkingLevel();
@@ -6770,7 +6801,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function rememberUserModel(model: { provider?: string; id?: string } | undefined) {
-		if (subagentChild || !model?.provider || !model?.id) return;
+		if (
+			subagentChild ||
+			!model?.provider ||
+			!model?.id ||
+			(hasExplicitCliSelection && !explicitCliSelectionChanged)
+		)
+			return;
 		const family = classifyProvider(model.provider, config.qwenProvider);
 		if (family) lastModelByFamily[family] = model.id;
 		persist(
@@ -6794,6 +6831,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			logEvent("remembered_model_skipped", { reason: "pi-subagents child owns model selection" });
 			return false;
 		}
+		if (explicitCli.model) {
+			logEvent("remembered_model_skipped", { reason: "explicit CLI model" });
+			return false;
+		}
 		const intended = intendedStartupModel();
 		if (!intended) {
 			logEvent("remembered_model_skipped", { reason: "no intended model" });
@@ -6803,7 +6844,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			ctx.model?.provider === intended.provider &&
 			ctx.model?.id === intended.id;
 		if (alreadyThere) {
-			restoreDesiredThinking(ctx);
+			if (!explicitCli.thinking) restoreDesiredThinking(ctx);
 			return true;
 		}
 		if (cursorReady) {
@@ -6844,11 +6885,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (ok) {
 			// Restore the user's level too — Pi clamped it to the fallback model's caps
 			// while creating the session.
-			const rememberedLevel = persistedState.lastUserThinkingLevel;
-			if (rememberedLevel) {
-				desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+			if (!explicitCli.thinking) {
+				const rememberedLevel = persistedState.lastUserThinkingLevel;
+				if (rememberedLevel) {
+					desiredThinkingLevel = rememberedLevel as ReasoningLevel;
+				}
+				restoreDesiredThinking(ctx);
 			}
-			restoreDesiredThinking(ctx);
 			ctx.ui?.notify?.(
 				`pi-multi-account: restored ${to} after catalog load (Pi had fallen back to ${from})`,
 				"info",
@@ -7928,6 +7971,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				) {
 					automaticModelTarget = same;
 					if (onlyActiveModels) unhideProvider(sourceModel.provider);
+					internalThinkingChanges++;
 					try {
 						await pi.setModel(
 							ctx.modelRegistry.find(sourceModel.provider, sourceModel.id) ?? {
@@ -7936,6 +7980,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 							},
 						);
 					} finally {
+						internalThinkingChanges--;
 						if (automaticModelTarget === same) automaticModelTarget = undefined;
 					}
 				}
@@ -10542,6 +10587,16 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		updateUsageStatus(ctx);
 	});
 
+	safeOn("thinking_level_select", (event, ctx) => {
+		if (subagentChild || internalThinkingChanges > 0) return;
+		const level = (event as any).level;
+		if (thinkingRank(level) < 0) return;
+		if (hasExplicitCliSelection) explicitCliSelectionChanged = true;
+		desiredThinkingLevel = level as ReasoningLevel;
+		thinkingClamp = undefined;
+		rememberUserModel(ctx?.model);
+	});
+
 	safeOn("model_select", (event, ctx) => {
 		const model = (event as any).model;
 		if (!model?.provider || !model?.id || subagentChild) return;
@@ -10559,6 +10614,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if ((event as any).source === "restore") return;
+		explicitCliSelectionChanged = true;
 		rememberUserModel(model);
 		// A manual model change is user control, not a permanent "never fail over" pin.
 		// Cancel stale pending work; if the selected model then returns a real limit, normal
