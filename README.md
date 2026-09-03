@@ -93,6 +93,7 @@ All three names are aliases for the same command: `/multi-account`, `/provider-f
 |---|---|
 | `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
 | `limits [refresh]` | Show active-account session/weekly limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
+| `accounts [refresh]` | List every configured slot with provider-reported alias/email, plan, limits, and live routing status. Uses cached metadata unless `refresh` is explicit. |
 | `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex model catalogs now. |
 | `add [anthropic\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. Subscription families (Anthropic, Codex, Kimi, Cursor) are logged in through `/login`; API-key families are filled in `auth.json`. |
 | `remove [anthropic\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | Remove an account from `auth.json` and rotation. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Aliases: `rm`, `delete`. |
