@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-09-03
+
 ### Added
 
 - **A `pi-subagents` child now keeps the exact model its parent runner launched.** Native children carry `PI_SUBAGENT_CHILD=1`; inside that boundary this extension remains available for provider/account registration, OAuth request shaping, and catalogs, but becomes passive as a router. It no longer restores the interactive process's remembered model during `session_start`, persists a child model as the user's preference, intercepts provider errors, switches models, queues inputs, routes compaction, or auto-continues. The provider error reaches `pi-subagents` unchanged, so its verified `fallbackModels` chain remains the single routing authority. This fixes children launched as `qoder/qfmodel:high` being changed milliseconds later to the parent process's `qoder/qmodel_38max:medium` or even an unrelated `openai-codex` model, then rejected by `model_verification_failed` after completing the work.
