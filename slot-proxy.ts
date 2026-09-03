@@ -66,6 +66,26 @@ export function isPublishedPlaceholder(value: string | undefined): boolean {
 
 export type ProxyFamily = "anthropic" | "codex";
 
+/**
+ * Which family, if any, this parent-owned loopback can serve.
+ *
+ * Base `anthropic` is included because a bare child on a subscription token is refused as a
+ * third-party app (measured 2026-08-30). Base `openai-codex` is not: the same child reached the
+ * network on Pi's built-in provider. Numbered Codex/Anthropic slots are included because a
+ * models.json entry has no OAuth method, so Pi never consults a published placeholder while an
+ * OAuth blob sits under the same key.
+ */
+export function proxyFamilyFor(slotId: string): ProxyFamily | undefined {
+	if (slotId === "anthropic" || /^anthropic-account-\d+$/.test(slotId)) return "anthropic";
+	if (/^openai-codex-account-\d+$/.test(slotId)) return "codex";
+	return undefined;
+}
+
+/** Numbered slots have no built-in OAuth method; the child-facing credential must be an API key. */
+export function needsChildFacingApiKey(slotId: string): boolean {
+	return /(?:-account-\d+)$/.test(slotId) && proxyFamilyFor(slotId) !== undefined;
+}
+
 /** Where each family's traffic really goes. */
 export const UPSTREAM_BASE: Readonly<Record<ProxyFamily, string>> = Object.freeze({
 	anthropic: "https://api.anthropic.com",
@@ -155,21 +175,29 @@ export type Admission =
  * Decide whether to serve a request at all.
  *
  * Two gates, and both matter. The slot has to be one we published — otherwise the port becomes a
- * way to reach any upstream through the user's tokens. And the caller has to present the
- * placeholder — otherwise every process on this machine can spend the user's subscription just by
- * finding the port. The placeholder is not a secret and is not treated as one; it is the marker of
- * "a child Pi launched against a route we published", which is exactly the population this serves.
+ * way to reach any upstream through the user's tokens. And the caller has to present either the
+ * published placeholder or the current access token for that slot — otherwise every process on
+ * this machine can spend the user's subscription just by finding the port. The placeholder is not
+ * a secret; the access token is, and a refusal never echoes either. The access-token path exists
+ * because a built-in Anthropic child still presents OAuth: Pi ignores a models.json apiKey when
+ * the stored credential is OAuth, and the request only becomes shapable if this proxy accepts it.
  */
 export function admitRequest(args: {
 	rawUrl: string;
 	headers: Readonly<Record<string, string | string[] | undefined>>;
 	routes: ReadonlyMap<string, ProxyRoute>;
+	/** Current access tokens for this slot. Never logged; compared only. */
+	acceptedSecrets?: readonly string[];
 }): Admission & { rest?: string } {
 	const parsed = parseProxyPath(args.rawUrl);
 	if (!parsed) return { ok: false, status: 404, message: "not a slot route" };
 	const route = args.routes.get(parsed.slotId);
 	if (!route) return { ok: false, status: 404, message: "unknown slot" };
-	if (!isPublishedPlaceholder(presentedCredential(args.headers))) {
+	const presented = presentedCredential(args.headers);
+	const accepted =
+		isPublishedPlaceholder(presented) ||
+		(!!presented && !!args.acceptedSecrets?.includes(presented));
+	if (!accepted) {
 		// Never echo what was presented: it may be a real credential belonging to whoever called.
 		return { ok: false, status: 401, message: "this route serves published slots only" };
 	}
@@ -266,4 +294,36 @@ export function placeholderKeyFor(family: ProxyFamily): string {
 /** The `models.json` route to publish for a slot served by this proxy. */
 export function publishedRouteFor(port: number, slotId: string): string {
 	return `http://127.0.0.1:${port}/${slotId}`;
+}
+
+/** True when this models.json entry is a loopback we published, not a user's own provider. */
+export function isOwnLoopbackPublication(
+	existing: unknown,
+	family: ProxyFamily,
+): boolean {
+	if (!existing || typeof existing !== "object") return false;
+	const rec = existing as Record<string, unknown>;
+	return (
+		rec.apiKey === placeholderKeyFor(family) &&
+		typeof rec.baseUrl === "string" &&
+		rec.baseUrl.startsWith("http://127.0.0.1:")
+	);
+}
+
+/**
+ * Drop loopback publications this proxy wrote. Cursor and user entries stay.
+ * Pass slot ids to drop only those; omit to drop every own loopback (a dead port left behind).
+ */
+export function dropOwnLoopbackPublications(
+	providers: Readonly<Record<string, unknown>>,
+	slotIds?: readonly string[],
+): Record<string, unknown> {
+	const next: Record<string, unknown> = { ...providers };
+	const ids = slotIds ?? Object.keys(next);
+	for (const id of ids) {
+		const family = proxyFamilyFor(id);
+		if (!family) continue;
+		if (isOwnLoopbackPublication(next[id], family)) delete next[id];
+	}
+	return next;
 }

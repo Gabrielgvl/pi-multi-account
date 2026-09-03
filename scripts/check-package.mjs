@@ -48,10 +48,19 @@ const secretPatterns = [
 	/AIza[0-9A-Za-z_-]{20,}/,
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
+const personalPatterns = [
+	/@gmail\.com/i,
+	new RegExp(["vitalij", "simko"].join(""), "i"),
+	new RegExp(["jrnl", "drive"].join(""), "i"),
+	/\/Users\/(?!example|runner|shared)[A-Za-z]/,
+];
 for (const name of names) {
 	const text = readFileSync(join(root, name), "utf8");
 	if (secretPatterns.some((pattern) => pattern.test(text))) {
 		throw new Error(`Potential secret marker in publishable file: ${name}`);
+	}
+	if (personalPatterns.some((pattern) => pattern.test(text))) {
+		throw new Error(`Personal identifier in publishable file: ${name}`);
 	}
 }
 console.log(`package check: pass (${names.length} files, ${packed[0].unpackedSize} bytes unpacked)`);

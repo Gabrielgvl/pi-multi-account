@@ -208,7 +208,7 @@ test("the account's identity travels with its usage, and shows in the footer", (
 
 	const footer = formatUsageCompact(snapshot!, Date.now());
 	assert.match(footer, /Codex A2/, "the slot is still named");
-	assert.match(footer, /alice/, `and the real account with it; footer: ${footer}`);
+	assert.match(footer, /alice/, `and the account local-part with it; footer: ${footer}`);
 	assert.match(footer, /free/, `along with the plan; footer: ${footer}`);
 	assert.match(footer, /60% left/, `without losing the quota; footer: ${footer}`);
 });
