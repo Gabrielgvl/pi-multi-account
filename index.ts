@@ -2227,6 +2227,20 @@ function getCodexAccountIdFromAccessToken(token: string): string | undefined {
 		?.chatgpt_account_id as string | undefined;
 }
 
+function getCodexAccountUserIdFromAccessToken(token: string): string | undefined {
+	const accountUserId = decodeJwtPayload(token)?.["https://api.openai.com/auth"]
+		?.chatgpt_account_user_id;
+	return typeof accountUserId === "string" && accountUserId.length > 0
+		? accountUserId
+		: undefined;
+}
+
+function getCodexUserIdFromAccessToken(token: string): string | undefined {
+	const userId = decodeJwtPayload(token)?.["https://api.openai.com/auth"]
+		?.chatgpt_user_id;
+	return typeof userId === "string" && userId.length > 0 ? userId : undefined;
+}
+
 function hash12(input: string) {
 	return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
@@ -2237,17 +2251,42 @@ function credentialHash(entry: AuthEntry): string | undefined {
 	return secret ? hash12(secret) : undefined;
 }
 
+/** Stable identity of one user's membership in one selected ChatGPT workspace. */
+function codexWorkspaceMembershipIdentity(entry: AuthEntry): string | undefined {
+	if (!entry.access) return undefined;
+	// Current live access tokens expose this account-scoped membership claim. Prefer it because a
+	// single ChatGPT user may belong to several workspaces with separate quota and entitlements.
+	const accountUserId = getCodexAccountUserIdFromAccessToken(entry.access);
+	if (accountUserId) return `codex-membership:${hash12(accountUserId)}`;
+	// OpenAI Codex documents chatgpt_user_id and chatgpt_account_id. Older tokens that omit the
+	// account-scoped claim remain distinguishable by the composite, without collapsing two users
+	// in one workspace or two workspaces belonging to one user.
+	const userId = getCodexUserIdFromAccessToken(entry.access);
+	const workspaceId =
+		getCodexAccountIdFromAccessToken(entry.access) ??
+		(typeof entry.accountId === "string" && entry.accountId.length > 0
+			? entry.accountId
+			: undefined);
+	if (userId && workspaceId)
+		return `codex-user-workspace:${hash12(`${userId}\0${workspaceId}`)}`;
+	if (userId) return `codex-user:${hash12(userId)}`;
+	return undefined;
+}
+
 /**
  * Identity of the REAL underlying account, used to detect the same account logged into multiple
  * slots. Deterministic where the data allows it:
- *   - `accountId` stored in auth.json (Codex/ChatGPT) → rock-solid, survives re-login.
- *   - else the account id embedded in a JWT access token (Codex fallback).
+ *   - `chatgpt_account_user_id` embedded in a Codex JWT → user membership within a workspace.
+ *   - else documented `chatgpt_user_id` + workspace id → the same membership identity.
+ *   - else `accountId` stored in auth.json / embedded in the JWT (legacy Codex fallback).
  *   - else a hash of the API key (same key = same account).
  *   - else a hash of the opaque access token. Opaque OAuth tokens (Anthropic) change on every login,
  *     so this only catches the literal same-token case. Two separate logins of the same Anthropic
  *     account are not deterministically identifiable from auth.json alone.
  */
 function accountIdentity(entry: AuthEntry): string | undefined {
+	const codexMembership = codexWorkspaceMembershipIdentity(entry);
+	if (codexMembership) return codexMembership;
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
 		return `acct:${hash12(entry.accountId)}`;
 	if (entry.access) {
@@ -2270,6 +2309,8 @@ function accountIdentity(entry: AuthEntry): string | undefined {
  * lifted by rotating a token anyway, so erring toward "keep the cooldown" is correct.
  */
 function stableAccountFingerprint(entry: AuthEntry): string | undefined {
+	const codexMembership = codexWorkspaceMembershipIdentity(entry);
+	if (codexMembership) return codexMembership;
 	if (typeof entry.accountId === "string" && entry.accountId.length > 0)
 		return `acct:${hash12(entry.accountId)}`;
 	if (entry.access) {
