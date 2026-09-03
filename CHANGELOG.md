@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Anthropic OAuth billing header now identifies Claude Code `2.1.259`.** This replaces the stale `2.1.241` client version reported in #29.
+
 - **Numbered OAuth accounts no longer degrade into an invalid API-key request after catalog refresh.** Child-facing aliases intentionally publish a non-secret placeholder through the local loopback proxy, but Codex and Anthropic catalog re-registration replaced that loopback URL with the public upstream. Pi then sent the placeholder directly to the provider and every account failed with `Could not parse your authentication token`. Catalog refresh now preserves the account-specific loopback route, and that provider error is classified as authentication failure rather than an unrelated request error.
 
 - **A message held for quota recovery is sent immediately after a successful manual account switch.** `/multi-account switch`, `next`, `best`, and ordinary model selection now wake the held-input queue instead of leaving it asleep behind the previous account's cooldown timer. Items leave the queue only after Pi accepts them, and session-owned pending markers prevent another live Pi window's stale timer from clearing or resurrecting newer work.
