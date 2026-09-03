@@ -1791,6 +1791,32 @@ test("manual next can override cooldowns without arming an automatic continuatio
 	);
 });
 
+test("a manual account switch immediately drains the message held behind the old account cooldown", async () => {
+	const t = setup({
+		current: { provider: "anthropic", id: "claude-opus-4-8" },
+		seedCooldownsMsFromNow: {
+			anthropic: 60 * 60 * 1000,
+			"openai-codex-account-2": 60 * 60 * 1000,
+		},
+	});
+
+	const held = await t.input("send this after I choose another account");
+	assert.deepEqual(held, { action: "handled" });
+	assert.equal(t.rec.sent.length, 0, "the message is held while every account is cooling");
+
+	await t.command("switch openai-codex-account-2");
+	assert.deepEqual(t.rec.sent, [
+		{
+			prompt: "send this after I choose another account",
+			options: { deliverAs: "followUp" },
+		},
+	]);
+	assert.ok(
+		t.rec.notifies.some((message) => /resumed 1 queued message/i.test(message)),
+		"the switch confirms that the held work was actually submitted",
+	);
+});
+
 test("slash commands bypass the cooldown input queue", async () => {
 	const t = setup({
 		accounts: ONE_ACCOUNT,
@@ -2810,10 +2836,20 @@ test("pi-subagents child keeps its explicit launch model and delegates fallback 
 			pendingFrom: "openai-codex-account-2/gpt-5.6-sol",
 			pendingReason: "parent session is waiting for quota reset",
 			pendingSince: 123,
+			pendingOwner: "parent-session-fixture",
 		},
 	});
+	const authBeforeChild = readFileSync(AUTH, "utf8");
+	const modelsBeforeChild = existsSync(MODELS)
+		? readFileSync(MODELS, "utf8")
+		: undefined;
 
 	await t.fire("session_start", { reason: "startup" });
+	assert.equal(
+		t.readState().pendingFrom,
+		"openai-codex-account-2/gpt-5.6-sol",
+		"child startup must preserve the parent's persisted pending recovery",
+	);
 	assert.deepEqual(t.ctx.model, { provider: "qoder", id: "qfmodel" });
 	assert.equal(t.thinkingLevel(), "high");
 	assert.deepEqual(
@@ -2821,7 +2857,39 @@ test("pi-subagents child keeps its explicit launch model and delegates fallback 
 		[],
 		"child startup must not restore the parent process's remembered model",
 	);
+	assert.equal(
+		readFileSync(AUTH, "utf8"),
+		authBeforeChild,
+		"a delegated child must not replace shared OAuth credentials with proxy placeholders",
+	);
+	assert.equal(
+		existsSync(MODELS) ? readFileSync(MODELS, "utf8") : undefined,
+		modelsBeforeChild,
+		"a delegated child must not publish its short-lived routes into shared models.json",
+	);
+	const localCodex = t.providerConfigs.get("openai-codex-account-2");
+	assert.match(String(localCodex?.baseUrl), /^http:\/\/127\.0\.0\.1:\d+\//);
+	assert.equal(
+		(
+			await callProxy(localCodex.baseUrl, "/codex/responses", {
+				authorization: "Bearer deliberately-wrong",
+			})
+		).status,
+		401,
+		"the child still needs a process-local route for the exact provider it was launched on",
+	);
+	assert.equal(
+		t.readState().pendingFrom,
+		"openai-codex-account-2/gpt-5.6-sol",
+		"serving a child proxy request must preserve the parent's pending recovery",
+	);
 
+	await t.fire("before_agent_start");
+	assert.equal(
+		t.readState().pendingFrom,
+		"openai-codex-account-2/gpt-5.6-sol",
+		"starting the child turn must not clear the parent's persisted pending recovery",
+	);
 	await finishError(t, "qoder", "qfmodel", "429 rate limit");
 	assert.deepEqual(
 		t.rec.setModels,
@@ -2830,20 +2898,16 @@ test("pi-subagents child keeps its explicit launch model and delegates fallback 
 	);
 	assert.equal(t.rec.continueCalls.length, 0);
 	assert.equal(t.rec.sent.length, 0);
-
 	await t.fire("model_select", {
 		model: { provider: "qoder", id: "qfmodel" },
 		source: "set",
 	});
 	await t.fire("session_shutdown");
-	assert.deepEqual(t.readState().lastUserModel, {
-		provider: "openai-codex-account-2",
-		id: "gpt-5.6-sol",
-	});
+	assert.equal(readFileSync(AUTH, "utf8"), authBeforeChild);
 	assert.equal(
-		t.readState().lastUserThinkingLevel,
-		"medium",
-		"a delegated child must not overwrite the interactive session preference",
+		existsSync(MODELS) ? readFileSync(MODELS, "utf8") : undefined,
+		modelsBeforeChild,
+		"child shutdown must not restore or unpublish files it never owned",
 	);
 	assert.equal(
 		t.readState().pendingFrom,

@@ -697,6 +697,8 @@ type ProviderFailoverState = {
 	pendingFrom?: ModelRef;
 	pendingSince?: number;
 	pendingReason?: string;
+	/** Session instance that owns this pending wake; prevents another Pi window's stale timer from clearing it. */
+	pendingOwner?: string;
 	lastSwitches?: SwitchRecord[];
 	/** Last model the user was actually on (failover destination included). Restored after catalogs load. */
 	lastUserModel?: { provider: string; id: string };
@@ -1228,6 +1230,7 @@ const DEFAULT_AUTH_ERROR_PATTERNS = [
 	"401",
 	"unauthorized",
 	"authentication_error",
+	"could not parse your authentication token",
 	"authentication token has been invalidated",
 	"token has been invalidated",
 	"invalid authentication",
@@ -2697,6 +2700,7 @@ function registerCodexCatalog(
 	pi: ExtensionAPI,
 	id: string,
 	models: Array<Record<string, unknown>>,
+	baseUrl = "https://chatgpt.com/backend-api",
 ) {
 	const name =
 		id === CODEX_BASE
@@ -2704,7 +2708,7 @@ function registerCodexCatalog(
 			: `ChatGPT Plus/Pro (Codex ${id})`;
 	pi.registerProvider(id, {
 		name,
-		baseUrl: "https://chatgpt.com/backend-api",
+		baseUrl,
 		api: "openai-codex-responses" as any,
 		oauth: codexOAuthOverride(id, name),
 		models: models as any,
@@ -3512,6 +3516,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// logins are unavailable, and the user is told once at session start.
 	const oauthUnavailable = piAiOauthUnavailableReason();
 	const subagentChild = isSubagentChildProcess();
+	const sessionInstanceId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	let config = loadConfig();
 	const automaticFailoverEnabled = () => config.enabled && !subagentChild;
 	debugLogEnabled = config.debugLog;
@@ -3579,7 +3584,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	 * beyond restoring what we previously hid.
 	 */
 	function applyOnlyActiveFilter(ctx: any, activeProvider?: string) {
-		if (!onlyActiveModels) return;
+		// A pi-subagents child was launched on one exact candidate. Hiding its registry through the
+		// interactive process's only-active policy would make that candidate unverifiable again.
+		if (subagentChild || !onlyActiveModels) return;
 		const active = activeProvider ?? ctx?.model?.provider;
 		if (!active) return;
 		let all: any[] = [];
@@ -4162,8 +4169,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 	}
 
-	function persist(extra?: Partial<ProviderFailoverState>) {
-		persistedState = {
+	function persist(
+		extra?: Partial<ProviderFailoverState>,
+		options: {
+			clearPending?: "owned" | "owned-or-legacy";
+			writeUserPreferences?: boolean;
+		} = {},
+	) {
+		let next: ProviderFailoverState = {
 			...persistedState,
 			...extra,
 			stateVersion: STATE_VERSION,
@@ -4184,6 +4197,65 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				codexModelCatalogByProvider.entries(),
 			),
 		};
+		// Every Pi window and delegated child shares this file. Preserve another live session's
+		// pending marker on ordinary writes, and let an explicit clear remove only a marker owned by
+		// this session. Otherwise an old wake timer can erase a newer session's held message.
+		const disk = loadState();
+		const diskHasPending = !!(disk.pendingFrom && disk.pendingReason);
+		const nextHasPending = !!(next.pendingFrom && next.pendingReason);
+		const canClearDiskPending =
+			options.clearPending === "owned-or-legacy"
+				? !disk.pendingOwner || disk.pendingOwner === sessionInstanceId
+				: options.clearPending === "owned"
+					? disk.pendingOwner === sessionInstanceId
+					: false;
+		const ordinaryWriteMustKeepDiskPending =
+			!options.clearPending &&
+			diskHasPending &&
+			(!nextHasPending ||
+				disk.pendingOwner !== sessionInstanceId ||
+				next.pendingOwner !== sessionInstanceId);
+		if (
+			ordinaryWriteMustKeepDiskPending ||
+			(!!options.clearPending && diskHasPending && !canClearDiskPending)
+		) {
+			next = {
+				...next,
+				pendingFrom: disk.pendingFrom,
+				pendingReason: disk.pendingReason,
+				pendingSince: disk.pendingSince,
+				pendingContinuationPrompt: disk.pendingContinuationPrompt,
+				pendingOwner: disk.pendingOwner,
+			};
+		} else if (
+			!options.clearPending &&
+			!diskHasPending &&
+			nextHasPending &&
+			next.pendingOwner !== sessionInstanceId
+		) {
+			// This process merely observed a marker that has since been cleared by its owner. Do not
+			// resurrect it during an unrelated usage/catalog persistence write.
+			next = {
+				...next,
+				pendingFrom: undefined,
+				pendingReason: undefined,
+				pendingSince: undefined,
+				pendingContinuationPrompt: undefined,
+				pendingOwner: undefined,
+			};
+		}
+		// Usage/catalog timers are allowed to persist their own telemetry, but they must not roll
+		// back a model choice saved by another live Pi window from an older in-memory snapshot.
+		// Only rememberUserModel opts into changing these shared user-preference fields.
+		if (!options.writeUserPreferences) {
+			next = {
+				...next,
+				lastUserModel: disk.lastUserModel,
+				lastUserThinkingLevel: disk.lastUserThinkingLevel,
+				lastModelByFamily: disk.lastModelByFamily,
+			};
+		}
+		persistedState = next;
 		saveState(persistedState);
 	}
 
@@ -4338,7 +4410,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						"OAuth refresh succeeded but the rotated credential could not be written to auth.json; run /login for this account",
 				};
 			}
-			if (needsAuthShadow(provider) && (isCursorProviderId(provider) || slotProxyPort !== undefined)) {
+			if (
+				ownsSharedChildPublication() &&
+				needsAuthShadow(provider) &&
+				(isCursorProviderId(provider) || slotProxyPort !== undefined)
+			) {
 				shadowChildFacingAuth([provider]);
 			}
 			reloadHostAuth(ctx);
@@ -4477,7 +4553,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// would not be selectable on them even once it is ranked first.
 		for (const provider of registeredSlots) {
 			if (classifyProvider(provider, config.qwenProvider) !== "anthropic") continue;
-			registerAnthropicSlot(pi, provider, ranked);
+			registerAnthropicSlot(
+				pi,
+				provider,
+				ranked,
+				numberedSlotBaseUrl(provider, "anthropic"),
+			);
 		}
 	}
 
@@ -4499,7 +4580,12 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				codexModelCatalogByProvider.get(provider)?.models.length
 			)
 				continue;
-			registerCodexCatalog(pi, provider, merged as Array<Record<string, unknown>>);
+			registerCodexCatalog(
+				pi,
+				provider,
+				merged as Array<Record<string, unknown>>,
+				numberedSlotBaseUrl(provider, "codex"),
+			);
 		}
 	}
 
@@ -4588,14 +4674,26 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		for (const provider of providers) {
 			const cached = codexModelCatalogByProvider.get(provider)?.models;
 			const models = cached?.length ? cached : registryFallback;
-			registerCodexCatalog(pi, provider, models as Array<Record<string, unknown>>);
+			registerCodexCatalog(
+				pi,
+				provider,
+				models as Array<Record<string, unknown>>,
+				provider === CODEX_BASE
+					? "https://chatgpt.com/backend-api"
+					: numberedSlotBaseUrl(provider, "codex"),
+			);
 		}
 		// Also keep unauthenticated spare login slots current so a newly logged-in account can select
 		// the new flagship before the next restart/session refresh.
 		for (const provider of registeredSlots) {
 			if (classifyProvider(provider, config.qwenProvider) !== "openai-codex") continue;
 			if (providers.includes(provider)) continue;
-			registerCodexCatalog(pi, provider, allKnown as Array<Record<string, unknown>>);
+			registerCodexCatalog(
+				pi,
+				provider,
+				allKnown as Array<Record<string, unknown>>,
+				numberedSlotBaseUrl(provider, "codex"),
+			);
 		}
 		if (changed) persist();
 		emitModelCatalogSnapshot(ctx);
@@ -4943,6 +5041,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	function startUsageStatusTimer(ctx: any) {
 		clearUsageStatusTimer();
+		// A delegated child neither displays the interactive footer nor owns fleet metadata. One
+		// poller per parallel child would multiply usage/catalog traffic for no routing benefit.
+		if (subagentChild) return;
 		if (!config.showUsage && !config.autoDiscoverModels) {
 			updateUsageStatus(ctx);
 			return;
@@ -5593,6 +5694,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				notify: (message, level) => ctx?.ui?.notify?.(message, level),
 				log: (kind, data) => logEvent(kind, data),
 				onProvision: (slots, port, models) => {
+					// Registration above is process-local and remains useful in a delegated child. The
+					// files below are shared with its parent and only the canonical publisher may touch
+					// them; otherwise a short-lived child leaves a dead Cursor route behind.
+					if (!ownsSharedChildPublication()) return;
 					// models.json entries point at the running proxy, so a bare child
 					// `pi -p` resolves cursor/* while any parent Pi process is alive.
 					//
@@ -5723,11 +5828,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					// declares none. Making the slot genuinely usable needs the Cursor pattern — a
 					// parent-owned loopback route with a non-secret placeholder — which Kimi does
 					// not have yet. See child-usability.ts.
-					provisionNativeSlot(id, {
-						api: "anthropic-messages",
-						baseUrl: KIMI_BASE_URL,
-						models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
-					});
+					if (ownsSharedChildPublication()) {
+						provisionNativeSlot(id, {
+							api: "anthropic-messages",
+							baseUrl: KIMI_BASE_URL,
+							models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
+						});
+					}
 				} else if (family === "ollama" || family === "qwen") {
 					registerApiKeySlot(pi, id, family, config.qwenProvider, ctx);
 				}
@@ -5735,6 +5842,28 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 		}
 		if (cursorAvailable) cursorReady = refreshCursorSlots(auth);
+	}
+
+	/**
+	 * Publish deterministic non-proxied aliases only after this process has proved that it owns
+	 * the shared models.json publication boundary. During factory construction the canonical
+	 * proxy port has not been claimed yet, so syncRegisteredSlots deliberately cannot write these
+	 * entries there. Replaying the Kimi publication here also repairs legacy string-only model
+	 * arrays once ownership is known.
+	 */
+	function publishOwnedNativeAliases(ctx?: any): void {
+		if (!ownsSharedChildPublication()) return;
+		for (const id of registeredSlots) {
+			if (classifyProvider(id, config.qwenProvider) !== "kimi-coding") continue;
+			const kimiModels = [
+				...new Set([...DEFAULT_KIMI_MODELS, ...hostModelIdsFor(ctx, KIMI_BASE)]),
+			];
+			provisionNativeSlot(id, {
+				api: "anthropic-messages",
+				baseUrl: KIMI_BASE_URL,
+				models: kimiModels.map((modelId) => kimiModelDef(modelId, id)),
+			});
+		}
 	}
 
 	function reloadHostAuth(ctx: any) {
@@ -6528,11 +6657,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		if (subagentChild || !model?.provider || !model?.id) return;
 		const family = classifyProvider(model.provider, config.qwenProvider);
 		if (family) lastModelByFamily[family] = model.id;
-		persist({
-			lastUserModel: { provider: model.provider, id: model.id },
-			lastUserThinkingLevel: desiredThinkingLevel ?? readThinkingLevel(),
-			lastModelByFamily: { ...lastModelByFamily },
-		});
+		persist(
+			{
+				lastUserModel: { provider: model.provider, id: model.id },
+				lastUserThinkingLevel: desiredThinkingLevel ?? readThinkingLevel(),
+				lastModelByFamily: { ...lastModelByFamily },
+			},
+			{ writeUserPreferences: true },
+		);
 	}
 
 	function intendedStartupModel(): { provider: string; id: string } | undefined {
@@ -7499,7 +7631,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return true;
 	}
 
-	function clearPendingContinuation() {
+	function clearPendingContinuation(options: { allowLegacy?: boolean } = {}) {
 		if (pendingWakeTimer) {
 			clearTimeout(pendingWakeTimer);
 			pendingWakeTimer = undefined;
@@ -7510,8 +7642,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			pendingFrom: undefined,
 			pendingSince: undefined,
 			pendingReason: undefined,
+			pendingOwner: undefined,
 		};
-		persist();
+		persist(undefined, {
+			clearPending: options.allowLegacy ? "owned-or-legacy" : "owned",
+		});
 	}
 
 	function pendingWakeProviders(): string[] {
@@ -7788,6 +7923,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			pendingFrom: from,
 			pendingContinuationPrompt: undefined,
 			pendingSince: persistedState.pendingSince ?? Date.now(),
+			pendingOwner: sessionInstanceId,
 		};
 		persist();
 		const delay = nextPendingWakeDelayMs();
@@ -7912,21 +8048,51 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		if (!allowAction("send a held message", ctx)) return;
-		const inputs = queuedUserInputs.splice(0);
+		const count = queuedUserInputs.length;
 		if (queuedInputWakeTimer) {
 			clearTimeout(queuedInputWakeTimer);
 			queuedInputWakeTimer = undefined;
 		}
-		for (let i = 0; i < inputs.length; i++) {
+		logEvent("queued_input_flush_started", {
+			count,
+			provider: ctx.model?.provider,
+			model: ctx.model?.id,
+		});
+		while (queuedUserInputs.length > 0) {
+			const input = queuedUserInputs[0];
 			// Supplying followUp is harmless while idle, but closes the check→send race if another
 			// automatic turn starts after the idle check and before this call. Await each submission so
-			// two held messages cannot both observe the same idle gap and start competing runs.
-			await pi.sendUserMessage(queuedInputContent(inputs[i]), { deliverAs: "followUp" });
+			// two held messages cannot both observe the same idle gap and start competing runs. Remove
+			// an item only after the host accepted it; a rejected dispatch must never eat the user's text.
+			try {
+				await pi.sendUserMessage(queuedInputContent(input), { deliverAs: "followUp" });
+				queuedUserInputs.shift();
+			} catch (error) {
+				logEvent("queued_input_dispatch_failed", {
+					remaining: queuedUserInputs.length,
+					error: String(error).slice(0, 200),
+				});
+				scheduleQueuedInputWake(ctx);
+				ctx.ui.notify(
+					"Provider failover: the selected account is ready, but Pi did not accept the held message yet; it remains queued and will retry automatically.",
+					"warning",
+				);
+				return;
+			}
 		}
+		logEvent("queued_input_flushed", { count });
 		ctx.ui.notify(
-			`Provider failover: resumed ${inputs.length} queued message(s) on ${ctx.model.provider}/${ctx.model.id}.`,
+			`Provider failover: resumed ${count} queued message(s) on ${ctx.model.provider}/${ctx.model.id}.`,
 			"info",
 		);
+	}
+
+	async function resumeQueuedInputsAfterManualSwitch(ctx: any, switched: boolean) {
+		if (!switched || queuedUserInputs.length === 0) return;
+		// A manual account choice is direct evidence that the user wants the held work to run there.
+		// Do not leave it sleeping behind the cooldown timestamp that belonged to the old account.
+		userAbortedChain = false;
+		await attemptQueuedInputResume(ctx);
 	}
 
 	function queueUserInput(ctx: any, text: string, images?: any[]) {
@@ -7938,6 +8104,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		queuedUserInputs.push({ text, images });
+		logEvent("queued_input_held", { count: queuedUserInputs.length });
 		const delay = nextModelAvailabilityDelayMs(ctx);
 		if (delay === undefined) return;
 		scheduleQueuedInputWake(ctx);
@@ -8145,9 +8312,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		if (command === "rediscover") {
 			const changed = refreshDiscovery(true, ctx);
-			runBackground("rediscover slot proxy republish", ctx, () =>
-				publishProxiedSlots(ctx),
-			);
+			runBackground("rediscover slot proxy republish", ctx, async () => {
+				await publishProxiedSlots(ctx);
+				publishOwnedNativeAliases(ctx);
+			});
 			runBackground("rediscover account metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
 				await syncCodexModelCatalog(ctx, true);
@@ -8498,6 +8666,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			currentPromptSwitch = undefined;
 			if (switched) {
 				announceManualChoice(ctx);
+				await resumeQueuedInputsAfterManualSwitch(ctx, true);
 			} else {
 				ctx.ui.notify(
 					`pi-multi-account: could not switch to "${target}"`,
@@ -8572,6 +8741,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					`pi-multi-account: already on the best available account (${ctx.model.provider}/${ctx.model.id})`,
 					"info",
 				);
+				await resumeQueuedInputsAfterManualSwitch(ctx, true);
 				return;
 			}
 			currentPromptSwitch = undefined;
@@ -8586,6 +8756,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			currentPromptSwitch = undefined;
 			if (switched) {
 				announceManualChoice(ctx);
+				await resumeQueuedInputsAfterManualSwitch(ctx, true);
 				// Saying "best" of an account nobody can measure overstates what was done. When no
 				// account confirms availability, this is the least-bad guess, and calling it that
 				// is the difference between a considered choice and looking random.
@@ -8717,7 +8888,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// provider was "cooling" and the round-robin collapsed onto whatever was left. Pass
 				// 0 so we only record lastLeftProvider (anti-ping-pong) and keep every account
 				// selectable, so repeated /multi-account next truly cycles through them all.
-				await switchToFallback(
+				const switched = await switchToFallback(
 					ctx,
 					ctx.model,
 					"manual /multi-account next",
@@ -8725,7 +8896,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 					{ manual: true },
 				);
 				currentPromptSwitch = undefined;
-				announceManualChoice(ctx);
+				if (switched) {
+					announceManualChoice(ctx);
+					await resumeQueuedInputsAfterManualSwitch(ctx, true);
+				}
 			}
 			return;
 		}
@@ -9476,6 +9650,17 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	const SLOT_PROXY_PORT =
 		Number(process.env.PI_MULTI_ACCOUNT_SLOT_PROXY_PORT) || 41977;
 
+	/**
+	 * One process owns every child-facing file publication. With the normal proxy enabled, the
+	 * canonical listening port is the ownership token. A pi-subagents child is never an owner,
+	 * even if no parent happens to be listening when it starts.
+	 */
+	function ownsSharedChildPublication(): boolean {
+		if (subagentChild) return false;
+		if (!config.childProxy) return true;
+		return !slotProxyForeignOwner && slotProxyPort === SLOT_PROXY_PORT;
+	}
+
 	refreshDiscovery(true);
 
 	// Runtime capability preflight. The RECURRING class of breakage in this extension is the
@@ -9705,6 +9890,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function stopSlotProxy() {
+		// Capture authority before clearing the port that proves it.
+		const publishedSharedFiles = ownsSharedChildPublication();
 		try {
 			slotProxyServer?.close();
 		} catch {
@@ -9713,7 +9900,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		slotProxyServer = undefined;
 		slotProxyPort = undefined;
 		slotProxyRoutes.clear();
-		if (slotProxyForeignOwner) return; // the owner's state outlives this process
+		if (!publishedSharedFiles) return; // the owner's state outlives this process
 		restoreChildFacingAuth();
 		unprovisionOwnLoopbacks();
 	}
@@ -9733,27 +9920,34 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			]),
 		].filter((id) => proxyFamilyOf(id) !== undefined && isEntryUsable(parent[id]));
 		if (slots.length === 0) {
-			if (!slotProxyForeignOwner) {
+			if (ownsSharedChildPublication()) {
 				restoreChildFacingAuth();
 				unprovisionOwnLoopbacks();
 			}
 			return;
 		}
 		const port = await startSlotProxy();
-		// Ownership is only knowable once the listen attempt resolved. A listener we could not
-		// start at all is ours to clean up; files another live process owns are not ours to
-		// publish, shadow, or tear down.
-		if (slotProxyForeignOwner) return;
 		if (port === undefined) {
-			restoreChildFacingAuth();
-			unprovisionOwnLoopbacks();
+			if (ownsSharedChildPublication()) {
+				restoreChildFacingAuth();
+				unprovisionOwnLoopbacks();
+			}
+			return;
+		}
+		// Every process needs local routes for the providers it registered against its own socket.
+		// Only the canonical interactive owner may advertise those routes through shared files.
+		for (const id of slots) {
+			const family = proxyFamilyOf(id);
+			if (family) slotProxyRoutes.set(id, { slotId: id, family });
+		}
+		if (!ownsSharedChildPublication()) {
+			logEvent("slot_proxy_local_routes_ready", { port, slots });
 			return;
 		}
 		shadowChildFacingAuth(slots);
 		for (const id of slots) {
 			const family = proxyFamilyOf(id);
 			if (!family) continue;
-			slotProxyRoutes.set(id, { slotId: id, family });
 			const baseUrl = publishedRouteFor(port, id);
 			if (family === "anthropic") {
 				provisionNativeSlot(id, {
@@ -9844,7 +10038,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 
 	safeOn("session_start", async (_event, ctx) => {
 		modelCatalogContext = ctx;
-		preflightHostCapabilities(ctx);
+		if (!subagentChild) preflightHostCapabilities(ctx);
 		// Looked at BEFORE discovery touches anything, so what is judged is the files as Pi
 		// published them rather than the version our own slot provisioning has just rewritten.
 		checkPiContract(ctx, "session_start");
@@ -9856,6 +10050,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// Publish the OAuth slots against a route this process serves, so anything spawned
 		// without this extension can actually run on the account the rotation chose.
 		await publishProxiedSlots(ctx);
+		publishOwnedNativeAliases(ctx);
 		// Not installed → silent skip (refreshCursorSlots warns only on the explicit path).
 		if (config.includeCursor) await refreshCursorSlots(readAuthFile(), ctx);
 		applyOnlyActiveFilter(ctx);
@@ -9867,7 +10062,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		// inherit and silently restart a previous session's paused work, so we drop any leftover
 		// pending state and reset all in-memory guards here. A delegated child shares
 		// the state file with its parent process and must not erase the parent's wake.
-		if (!subagentChild && hasPendingResume()) clearPendingContinuation();
+		if (!subagentChild && hasPendingResume())
+			clearPendingContinuation({ allowLegacy: true });
 		autoContinuesThisPrompt = 0;
 		resetGovernor();
 		startFreshFailoverChain();
@@ -9899,8 +10095,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		}
 		// Refresh every account BEFORE deciding the selected model is unavailable. Otherwise a
 		// plan upgrade can revive the current account milliseconds after startup preflight has
-		// already switched away from it using the old plan's stale 100% snapshot.
-		await refreshRotationUsage(ctx);
+		// already switched away from it using the old plan's stale 100% snapshot. The delegated
+		// runner owns fallback selection in a child, so multiplying that fleet-wide probe across
+		// every parallel child buys nothing.
+		if (!subagentChild) await refreshRotationUsage(ctx);
 		await syncCodexModelCatalog(ctx);
 		await syncOllamaModelCatalog(ctx);
 		// Pi restores the session model BEFORE extension catalogs finish registering
@@ -10155,6 +10353,10 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	// resurrection — this is what stops maxAutoContinuesPerPrompt from resetting every
 	// iteration (the bug that let the failover loop run forever).
 	safeOn("before_agent_start", async (_event, ctx) => {
+		// The child shares the persisted recovery file with its parent. It must not only avoid
+		// switching models here; it must avoid clearing the parent's pending wake when its own
+		// explicitly selected turn starts.
+		if (subagentChild) return;
 		await ensureReadyModel(
 			ctx,
 			"last-moment preflight: selected account unavailable",
@@ -10219,6 +10421,11 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		currentPromptSwitch = undefined;
 		userAbortedChain = false;
 		if (hasPendingResume()) clearPendingContinuation();
+		if (queuedUserInputs.length > 0) {
+			runBackground("manual model selection queued input resume", ctx, () =>
+				attemptQueuedInputResume(ctx),
+			);
+		}
 	});
 
 	safeOn("after_provider_response", (event, ctx) => {
