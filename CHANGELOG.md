@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Canonical Codex child requests stay on the selected account.** With `childProxy` enabled, an extension-free child can keep its exact `openai-codex/<model>` identity while the parent-owned loopback serves the currently healthy Codex account. The child payload and response remain unchanged, OAuth material stays out of published files and diagnostics, and a user-owned canonical `models.json` entry is never overwritten. When every Codex account is cooling down, the extension removes its own canonical loopback entry so Pi can use its native fallback instead of a dead 404 route.
+
 ## [1.21.0] - 2026-09-03
 
 ### Added

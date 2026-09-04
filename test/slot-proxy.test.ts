@@ -322,15 +322,16 @@ test("a Codex credential with no account id sends none, rather than the placehol
 	assert.equal(shaped.headers["chatgpt-account-id"], undefined);
 });
 
-test("base Anthropic and numbered Anthropic/Codex slots are proxied; base Codex is not", () => {
+test("base Anthropic/Codex and numbered slots are proxied", () => {
 	assert.equal(proxyFamilyFor("anthropic"), "anthropic");
 	assert.equal(proxyFamilyFor("anthropic-account-2"), "anthropic");
+	assert.equal(proxyFamilyFor("openai-codex"), "codex");
 	assert.equal(proxyFamilyFor("openai-codex-account-4"), "codex");
-	assert.equal(proxyFamilyFor("openai-codex"), undefined);
 	assert.equal(proxyFamilyFor("zai"), undefined);
 	assert.equal(needsChildFacingApiKey("anthropic-account-2"), true);
 	assert.equal(needsChildFacingApiKey("openai-codex-account-4"), true);
 	assert.equal(needsChildFacingApiKey("anthropic"), false);
+	assert.equal(needsChildFacingApiKey("openai-codex"), false);
 });
 
 test("a built-in Anthropic child is admitted when it presents the current access token", () => {
@@ -373,6 +374,10 @@ test("stop drops every own loopback, including numbered slots left on a dead por
 			apiKey: PROXY_PLACEHOLDER_JWT,
 			baseUrl: "http://127.0.0.1:41977/openai-codex-account-4",
 		},
+		"openai-codex": {
+			apiKey: PROXY_PLACEHOLDER_JWT,
+			baseUrl: "http://127.0.0.1:41977/openai-codex",
+		},
 		cursor: {
 			apiKey: "cursor-own-placeholder",
 			baseUrl: "http://127.0.0.1:59265/v1",
@@ -383,17 +388,24 @@ test("stop drops every own loopback, including numbered slots left on a dead por
 	assert.equal(next.anthropic, undefined);
 	assert.equal(next["anthropic-account-2"], undefined);
 	assert.equal(next["openai-codex-account-4"], undefined);
+	assert.equal(next["openai-codex"], undefined);
 	assert.equal(next.cursor, providers.cursor);
 	assert.equal(next.zai, providers.zai);
 });
 
-test("a user's own Anthropic models.json entry is not treated as our loopback", () => {
+test("a user's own provider entries are not treated as our loopback", () => {
 	const providers = {
 		anthropic: {
 			apiKey: "sk-user",
 			baseUrl: "https://api.anthropic.com",
 		},
+		"openai-codex": {
+			api: "openai-codex-responses",
+			baseUrl: "https://example.invalid/codex",
+			models: [{ id: "gpt-5.5" }],
+		},
 	};
 	assert.equal(isOwnLoopbackPublication(providers.anthropic, "anthropic"), false);
+	assert.equal(isOwnLoopbackPublication(providers["openai-codex"], "codex"), false);
 	assert.deepEqual(dropOwnLoopbackPublications(providers), providers);
 });

@@ -9315,6 +9315,318 @@ test("the Codex slot is published with a token-shaped placeholder that carries n
 	}
 });
 
+test("a recovered canonical Codex route is republished by the background sweep", async () => {
+	rmSync(MODELS, { force: true });
+	const provider = "openai-codex-account-2";
+	const now = Date.now();
+	const t = setup({
+		current: { provider, id: "gpt-5.5" },
+		config: { autoDiscoverModels: true, usageStatusRefreshMs: 60_000 },
+		accounts: {
+			[provider]: {
+				type: "oauth",
+				access: "sweep-test-access",
+				refresh: "sweep-test-refresh",
+				accountId: "sweep-test-account",
+			},
+		},
+		seedState: {
+			stateVersion: 5,
+			exhaustedUntilByProvider: { [provider]: now + 60_000 },
+			exhaustedUntilByModel: {},
+			lastProbeAtByProvider: {},
+			invalidatedByProvider: {},
+			usageByProvider: {
+				[provider]: {
+					provider,
+					family: "codex",
+					fetchedAt: now,
+					serviceable: false,
+					primary: { usedPercent: 100, resetAt: now + 60_000 },
+				},
+			},
+			codexModelCatalogByProvider: {
+				[provider]: { fetchedAt: now, models: [{ id: "gpt-5.5" }] },
+			},
+			lastSwitches: [],
+		},
+	});
+	const realSetInterval = globalThis.setInterval;
+	let usageSweep: (() => void) | undefined;
+	globalThis.setInterval = ((
+		handler: (...args: any[]) => void,
+		timeout: number,
+		...args: any[]
+	) => {
+		usageSweep = handler as () => void;
+		return realSetInterval(handler, timeout, ...args);
+	}) as typeof setInterval;
+	try {
+		await t.fire("session_start");
+		assert.equal(
+			JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex"],
+			undefined,
+			"a cooled Codex account must not publish the canonical route",
+		);
+		assert.ok(usageSweep, "session_start must install the existing usage/status sweep");
+
+		await t.command("reset");
+		assert.equal(t.readState().exhaustedUntilByProvider?.[provider], undefined);
+		usageSweep();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const restored = JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex"];
+		assert.ok(restored, "the background sweep must republish after cooldown recovery");
+		assert.equal(new URL(restored.baseUrl).hostname, "127.0.0.1");
+		assert.equal(new URL(restored.baseUrl).pathname, "/openai-codex");
+	} finally {
+		globalThis.setInterval = realSetInterval;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("an unavailable canonical Codex route is unpublished and can recover", async () => {
+	rmSync(MODELS, { force: true });
+	const access = "canonical-test-access";
+	const refresh = "canonical-test-refresh";
+	const accountId = "canonical-test-account";
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { cooldownMs: 60_000 },
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access,
+				refresh,
+				accountId,
+			},
+		},
+	});
+	const realFetch = globalThis.fetch;
+	const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+	try {
+		await t.fire("session_start");
+		const canonical = JSON.parse(readFileSync(MODELS, "utf8")).providers[
+			"openai-codex"
+		];
+		assert.ok(canonical?.baseUrl, "the canonical child route must be published");
+
+		globalThis.fetch = (async (input: any, init: any) => {
+			const url = String(input);
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				seen.push({ url, headers: { ...(init?.headers ?? {}) } });
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as typeof fetch;
+
+		await finishError(
+			t,
+			"openai-codex-account-2",
+			"gpt-5.5",
+			"Codex error: The usage limit has been reached",
+		);
+		const unavailable = await callProxy(canonical.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${canonical.apiKey}`,
+		},
+		);
+		assert.equal(unavailable.status, 404);
+		assert.equal(seen.length, 0, "an unavailable route must not reach upstream");
+		assert.equal(
+			JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex"],
+			undefined,
+			"removing the in-memory route must also restore native Codex fallback",
+		);
+
+		// A stale child may still hold the old loopback URL. Once the account recovers, the route
+		// is rebuilt instead of remaining permanently dead behind the old missing-route guard.
+		await t.command("reset");
+		const recovered = await callProxy(canonical.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${canonical.apiKey}`,
+		},
+		);
+		assert.equal(recovered.status, 200);
+		const republished = JSON.parse(readFileSync(MODELS, "utf8")).providers?.["openai-codex"];
+		assert.equal(
+			republished?.baseUrl,
+			canonical.baseUrl,
+			"recovery must republish the owned canonical loopback",
+		);
+		assert.equal(republished?.api, "openai-codex-responses");
+		assert.equal(republished?.apiKey, canonical.apiKey);
+		assert.equal(seen.length, 1);
+		assert.equal(seen[0].headers.authorization, `Bearer ${access}`);
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a user-owned canonical Codex models entry is preserved during proxy publication", async () => {
+	rmSync(MODELS, { force: true });
+	const userEntry = {
+		api: "openai-codex-responses",
+		baseUrl: "https://user.example/codex",
+		models: [{ id: "gpt-5.5" }],
+	};
+	writeFileSync(MODELS, JSON.stringify({ providers: { "openai-codex": userEntry } }));
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "user-entry-test-access",
+				refresh: "user-entry-test-refresh",
+				accountId: "user-entry-test-account",
+			},
+		},
+	});
+	try {
+		await t.fire("session_start");
+		assert.deepEqual(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex"], userEntry);
+	} finally {
+		await t.fire("session_shutdown");
+		assert.deepEqual(JSON.parse(readFileSync(MODELS, "utf8")).providers["openai-codex"], userEntry);
+		rmSync(MODELS, { force: true });
+	}
+});
+
+test("a canonical Codex child route uses the selected account without changing its payload", async () => {
+	rmSync(MODELS, { force: true });
+	const access = "selected-account-access";
+	const refresh = "selected-account-refresh";
+	const accountId = "selected-account-id";
+	const otherAccess = "other-account-access";
+	const otherRefresh = "other-account-refresh";
+	const t = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		accounts: {
+			"openai-codex-account-2": {
+				type: "oauth",
+				access,
+				refresh,
+				accountId,
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: otherAccess,
+				refresh: otherRefresh,
+				accountId: "other-account-id",
+			},
+		},
+	});
+	const realFetch = globalThis.fetch;
+	const seen: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
+	try {
+		await t.fire("session_start");
+		const published = readFileSync(MODELS, "utf8");
+		const canonical = JSON.parse(published).providers["openai-codex"];
+		assert.ok(canonical?.baseUrl, "the canonical child route must be published");
+		assert.equal(published.includes(access), false);
+		assert.equal(published.includes(refresh), false);
+		assert.equal(published.includes(accountId), false);
+		assert.equal(published.includes(otherAccess), false);
+		assert.equal(published.includes(otherRefresh), false);
+
+		globalThis.fetch = (async (input: any, init: any) => {
+			seen.push({
+				url: String(input),
+				headers: { ...(init?.headers ?? {}) },
+				body: Buffer.from(init?.body ?? "").toString("utf8"),
+			});
+			return new Response(JSON.stringify({ id: "response-from-selected-account" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch;
+
+		const body = JSON.stringify({
+			model: "gpt-5.5",
+			input: [{ role: "user", content: "keep this payload" }],
+			stream: false,
+		});
+		const response = await callProxy(canonical.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${canonical.apiKey}`,
+			"chatgpt-account-id": "pi-multi-account-proxy",
+		}, body);
+		assert.equal(response.status, 200);
+		assert.equal(response.body, JSON.stringify({ id: "response-from-selected-account" }));
+		assert.equal(seen.length, 1);
+		assert.equal(seen[0].url, "https://chatgpt.com/backend-api/codex/responses");
+		assert.equal(seen[0].headers.authorization, `Bearer ${access}`);
+		assert.equal(seen[0].headers["chatgpt-account-id"], accountId);
+		assert.equal(seen[0].body, body, "the canonical child's model payload must pass through intact");
+		assert.equal(JSON.stringify(seen[0].headers).includes(String(canonical.apiKey)), false);
+
+		// A real failover must move the same canonical child route to the account Pi selected next.
+		await finishError(
+			t,
+			"openai-codex-account-2",
+			"gpt-5.5",
+			"Codex error: The usage limit has been reached",
+		);
+		assert.equal(t.ctx.model.provider, "openai-codex-account-3");
+		const failoverResponse = await callProxy(canonical.baseUrl, "/codex/responses", {
+			authorization: `Bearer ${canonical.apiKey}`,
+			"chatgpt-account-id": "pi-multi-account-proxy",
+		}, body);
+		assert.equal(failoverResponse.status, 200);
+		assert.equal(seen.length, 2);
+		assert.equal(seen[1].headers.authorization, `Bearer ${otherAccess}`);
+		assert.equal(seen[1].headers["chatgpt-account-id"], "other-account-id");
+		assert.equal(seen[1].body, body, "failover must preserve the canonical child's payload");
+
+		const rejected = await callProxy(canonical.baseUrl, "/codex/responses", {
+			authorization: "Bearer caller-that-was-not-published",
+		}, body);
+		assert.equal(rejected.status, 401);
+		assert.equal(seen.length, 2, "an unauthorized canonical caller must not reach upstream");
+		assert.equal(rejected.body.includes("caller-that-was-not-published"), false);
+	} finally {
+		globalThis.fetch = realFetch;
+		await t.fire("session_shutdown");
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-2"]?.access, access);
+		assert.equal(JSON.parse(readFileSync(AUTH, "utf8"))["openai-codex-account-3"]?.access, otherAccess);
+		const after = existsSync(MODELS)
+			? JSON.parse(readFileSync(MODELS, "utf8"))
+			: {};
+		assert.equal(after.providers?.["openai-codex"], undefined);
+		const debug = JSON.stringify(readDebugLog());
+		for (const value of [access, refresh, accountId, otherAccess, otherRefresh]) {
+			assert.equal(debug.includes(value), false, "credential material must stay out of diagnostics");
+		}
+		rmSync(MODELS, { force: true });
+	}
+
+	// Turning the proxy off keeps the old direct/native provider path and publishes no route.
+	rmSync(MODELS, { force: true });
+	const disabled = setup({
+		current: { provider: "openai-codex-account-2", id: "gpt-5.5" },
+		config: { childProxy: false },
+		accounts: {
+			"openai-codex-account-2": { type: "oauth", access, refresh, accountId },
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: otherAccess,
+				refresh: otherRefresh,
+				accountId: "other-account-id",
+			},
+		},
+	});
+	await disabled.fire("session_start");
+	const disabledModels = existsSync(MODELS)
+		? JSON.parse(readFileSync(MODELS, "utf8"))
+		: {};
+	assert.equal(disabledModels.providers?.["openai-codex"], undefined);
+	assert.equal(
+		disabled.providerConfigs.get("openai-codex-account-2")?.baseUrl,
+		"https://chatgpt.com/backend-api",
+	);
+	await disabled.fire("session_shutdown");
+});
+
 // ---------------------------------------------------------------------------
 // The rotation that never sent a request
 //

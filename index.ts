@@ -61,6 +61,7 @@ import {
 	placeholderKeyFor,
 	proxyFamilyFor,
 	publishedRouteFor,
+	isOwnLoopbackPublication,
 	shapeUpstreamRequest,
 	type ProxyFamily,
 	type ProxyRoute,
@@ -854,7 +855,13 @@ function slotsAsAChildSeesThem(
 					: credentialType === "api_key"
 						? "api_key"
 						: "none",
-			builtin: !/-account-\d+$/.test(slotId) && entry === undefined,
+			// Anthropic and Codex are Pi built-ins even when this extension publishes a
+			// child-facing loopback override in models.json. The built-in OAuth method
+			// still owns those canonical provider ids; only numbered aliases are ours.
+			builtin:
+				slotId === ANTHROPIC_BASE ||
+				slotId === CODEX_BASE ||
+				(!/-account-\d+$/.test(slotId) && entry === undefined),
 			publishedApiKey: typeof entry?.apiKey === "string" ? entry.apiKey : undefined,
 			publishedBaseUrl: typeof entry?.baseUrl === "string" ? entry.baseUrl : undefined,
 		});
@@ -965,7 +972,11 @@ function nativeModelEntries(models: unknown[]): NativeModelEntry[] {
  * Failover state lives in provider-failover-state.json, our own file.
  * Merge-only: existing user entries and unrelated keys are preserved verbatim.
  */
-function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void {
+function provisionNativeSlot(
+	provider: string,
+	entry: NativeProviderEntry,
+	preserveExisting = false,
+): void {
 	try {
 		const models = nativeModelEntries(entry.models);
 		const normalized: Record<string, unknown> = {
@@ -984,6 +995,16 @@ function provisionNativeSlot(provider: string, entry: NativeProviderEntry): void
 				? parsed.providers
 				: {};
 		const existing = providers[provider];
+		// A user's canonical Codex definition may carry an intentional endpoint or
+		// credential. The child route is optional; never replace that definition just
+		// to make the proxy available.
+		if (
+			preserveExisting &&
+			existing !== undefined &&
+			!isOwnLoopbackPublication(existing, "codex")
+		) {
+			return;
+		}
 		if (
 			existing?.baseUrl === normalized.baseUrl &&
 			existing?.api === normalized.api &&
@@ -5273,6 +5294,13 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		usageStatusTimer = setInterval(() => {
 			runBackground("rotation metadata refresh", ctx, async () => {
 				await refreshRotationUsage(ctx);
+				if (
+					config.childProxy &&
+					ownsSharedChildPublication() &&
+					typeof slotProxyPort === "number"
+				) {
+					refreshCanonicalCodexRoute(ctx);
+				}
 				// Re-registering provider models is safe while idle and avoids touching the registry in
 				// the middle of a streaming request. The five-minute catalog TTL keeps this sweep cheap.
 				if (ctx?.isIdle?.() !== false) await syncCodexModelCatalog(ctx);
@@ -9979,6 +10007,52 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		return proxyFamilyFor(slotId);
 	}
 
+	/** Prefer the active Codex account, then retain the last selected one, then rotation order. */
+	function chooseCodexProxySlot(
+		ctx: any,
+		parent: Record<string, AuthEntry>,
+		preferred: readonly string[] = [],
+	): string | undefined {
+		const active = ctx?.model?.provider;
+		const candidates = [
+			...(active && proxyFamilyOf(active) === "codex" ? [active] : []),
+			...preferred,
+			...rotation,
+			...Object.keys(parent),
+		].filter(
+			(id, index, all) =>
+				all.indexOf(id) === index &&
+				proxyFamilyOf(id) === "codex" &&
+				isEntryUsable(parent[id]) &&
+				!isInvalidated(id),
+		);
+		const now = Date.now();
+		return candidates.find((id) => providerRecoveryAt(id, now) <= now);
+	}
+
+	function refreshCanonicalCodexRoute(ctx: any): void {
+		const current = slotProxyRoutes.get(CODEX_BASE);
+		const target = chooseCodexProxySlot(
+			ctx,
+			readAuthFile(),
+			current ? [current.slotId] : [],
+		);
+		if (target) {
+			if (typeof slotProxyPort === "number") {
+				// Check models.json on every refresh: the in-memory route can outlive a removed or
+				// externally drifted publication. The helper is owner-gated and idempotent.
+				publishCanonicalCodexSlot(target, slotProxyPort);
+			}
+			slotProxyRoutes.set(CODEX_BASE, { slotId: target, family: "codex" });
+			return;
+		}
+		// Keep the file and in-memory route in sync: without this, a child follows a dead loopback
+		// and gets 404 instead of letting Pi use its native Codex route. Only the owner may touch the
+		// shared file, and unprovisionOwnLoopbacks leaves a user's canonical definition intact.
+		slotProxyRoutes.delete(CODEX_BASE);
+		if (ownsSharedChildPublication()) unprovisionOwnLoopbacks([CODEX_BASE]);
+	}
+
 	function numberedSlotBaseUrl(id: string, family: ProxyFamily): string {
 		if (typeof slotProxyPort === "number") return publishedRouteFor(slotProxyPort, id);
 		return family === "anthropic"
@@ -10038,10 +10112,14 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			return;
 		}
 		const parsed = parseProxyPath(req.url ?? "");
+		if (parsed?.slotId === CODEX_BASE) refreshCanonicalCodexRoute(slotProxyContext);
+		const presentedEntry = parsed ? readAuthFile()[parsed.slotId] : undefined;
 		const presentedSecret =
-			parsed && typeof readAuthFile()[parsed.slotId]?.access === "string"
-				? readAuthFile()[parsed.slotId]?.access
-				: undefined;
+			typeof presentedEntry?.access === "string"
+				? presentedEntry.access
+				: typeof presentedEntry?.key === "string"
+					? presentedEntry.key
+					: undefined;
 		const verdict = admitRequest({
 			rawUrl: req.url ?? "",
 			headers: req.headers ?? {},
@@ -10199,6 +10277,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		unprovisionOwnLoopbacks();
 	}
 
+	function publishCanonicalCodexSlot(target: string, port: number): void {
+		if (!ownsSharedChildPublication()) return;
+		const cached = codexModelCatalogByProvider.get(target)?.models as
+			| Array<Record<string, unknown>>
+			| undefined;
+		const models = (
+			cached?.length
+				? cached
+				: registryCodexModelOrder.length > 0
+					? registryCodexModelOrder.map(codexModelDef)
+					: DEFAULT_CODEX_MODELS.map(codexModelDef)
+		) as Array<Record<string, unknown>>;
+		provisionNativeSlot(
+			CODEX_BASE,
+			{
+				api: "openai-codex-responses",
+				baseUrl: publishedRouteFor(port, CODEX_BASE),
+				apiKey: placeholderKeyFor("codex"),
+				models,
+			},
+			true,
+		);
+	}
+
 	/**
 	 * Publish every proxied OAuth account against the running proxy, so a child resolves the
 	 * account AND can authenticate to it. Without the second half the first is a trap.
@@ -10228,18 +10330,30 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			}
 			return;
 		}
+		const codexProxySlot = chooseCodexProxySlot(ctx, parent);
+		const publishedSlots = [
+			...slots.filter((id) => id !== CODEX_BASE),
+			...(codexProxySlot ? [CODEX_BASE] : []),
+		];
 		// Every process needs local routes for the providers it registered against its own socket.
 		// Only the canonical interactive owner may advertise those routes through shared files.
 		for (const id of slots) {
+			if (id === CODEX_BASE) continue;
 			const family = proxyFamilyOf(id);
 			if (family) slotProxyRoutes.set(id, { slotId: id, family });
 		}
+		if (codexProxySlot) {
+			slotProxyRoutes.set(CODEX_BASE, { slotId: codexProxySlot, family: "codex" });
+		} else {
+			slotProxyRoutes.delete(CODEX_BASE);
+		}
 		if (!ownsSharedChildPublication()) {
-			logEvent("slot_proxy_local_routes_ready", { port, slots });
+			logEvent("slot_proxy_local_routes_ready", { port, slots: publishedSlots });
 			return;
 		}
+		if (!codexProxySlot) unprovisionOwnLoopbacks([CODEX_BASE]);
 		shadowChildFacingAuth(slots);
-		for (const id of slots) {
+		for (const id of publishedSlots) {
 			const family = proxyFamilyOf(id);
 			if (!family) continue;
 			const baseUrl = publishedRouteFor(port, id);
@@ -10253,27 +10367,31 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						baseUrl,
 					})),
 				});
+			} else if (id === CODEX_BASE && codexProxySlot) {
+				publishCanonicalCodexSlot(codexProxySlot, port);
 			} else {
 				const cached = codexModelCatalogByProvider.get(id)?.models as
 					| Array<Record<string, unknown>>
 					| undefined;
-				const models = (cached?.length ? cached : DEFAULT_CODEX_MODELS.map(codexModelDef)) as Array<
-					Record<string, unknown>
-				>;
+				const models = (
+					cached?.length ? cached : DEFAULT_CODEX_MODELS.map(codexModelDef)
+				) as Array<Record<string, unknown>>;
 				// Published as Codex's own API on purpose: Pi then shapes the body the way that
-				// backend requires (`store: false`, the instructions field, its own headers), which
-				// a generic `openai-responses` slot would not. The cost is that Pi insists on
-				// reading an account id out of the key, which is why that family's placeholder is
-				// JWT-shaped.
-				provisionNativeSlot(id, {
-					api: "openai-codex-responses",
-					baseUrl,
-					apiKey: placeholderKeyFor(family),
-					models,
-				});
+				// backend requires (`store: false`, the instructions field), while the proxy
+				// supplies the selected account's credential. The JWT-shaped placeholder is
+				// required because Pi parses an account id before sending the request.
+				provisionNativeSlot(
+					id,
+					{
+						api: "openai-codex-responses",
+						baseUrl,
+						apiKey: placeholderKeyFor(family),
+						models,
+					},
+				);
 			}
 		}
-		logEvent("slot_proxy_published", { port, slots });
+		logEvent("slot_proxy_published", { port, slots: publishedSlots });
 	}
 
 	function preflightHostCapabilities(ctx: any) {

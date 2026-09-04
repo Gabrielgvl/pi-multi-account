@@ -70,14 +70,15 @@ export type ProxyFamily = "anthropic" | "codex";
  * Which family, if any, this parent-owned loopback can serve.
  *
  * Base `anthropic` is included because a bare child on a subscription token is refused as a
- * third-party app (measured 2026-08-30). Base `openai-codex` is not: the same child reached the
- * network on Pi's built-in provider. Numbered Codex/Anthropic slots are included because a
+ * third-party app (measured 2026-08-30). Base `openai-codex` is included so a canonical child
+ * request can use the healthy Codex account selected by the parent, without changing the
+ * child's logical provider/model. Numbered Codex/Anthropic slots are included because a
  * models.json entry has no OAuth method, so Pi never consults a published placeholder while an
  * OAuth blob sits under the same key.
  */
 export function proxyFamilyFor(slotId: string): ProxyFamily | undefined {
 	if (slotId === "anthropic" || /^anthropic-account-\d+$/.test(slotId)) return "anthropic";
-	if (/^openai-codex-account-\d+$/.test(slotId)) return "codex";
+	if (slotId === "openai-codex" || /^openai-codex-account-\d+$/.test(slotId)) return "codex";
 	return undefined;
 }
 
