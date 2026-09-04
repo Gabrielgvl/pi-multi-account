@@ -3107,6 +3107,43 @@ test("explicit CLI model wins over remembered startup state and is not remembere
 	assert.equal(t.readState().lastUserThinkingLevel, "low");
 });
 
+test("automatic failover preserves an explicit CLI model across Codex accounts", async () => {
+	const t = setup({
+		accounts: {
+			"openai-codex": { type: "api_key" },
+			"openai-codex-account-2": {
+				type: "oauth",
+				access: "c2",
+				refresh: "cr2",
+				accountId: "codex-2",
+			},
+			"openai-codex-account-3": {
+				type: "oauth",
+				access: "c3",
+				refresh: "cr3",
+				accountId: "codex-3",
+			},
+		},
+		hostCodexModels: ["gpt-5.6-sol", "gpt-5.6-luna"],
+		current: { provider: "openai-codex", id: "gpt-5.6-luna" },
+		cliArgs: ["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max"],
+		seedCooldownsMsFromNow: { "openai-codex": 60 * 60 * 1000 },
+	});
+	await t.fire("session_start", { reason: "startup" });
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-2",
+		id: "gpt-5.6-luna",
+	});
+	assert.equal(t.thinkingLevel(), "max");
+
+	await finishError(t, "openai-codex-account-2", "gpt-5.6-luna", "429 rate limit");
+	assert.deepEqual(t.ctx.model, {
+		provider: "openai-codex-account-3",
+		id: "gpt-5.6-luna",
+	});
+	assert.equal(t.thinkingLevel(), "max");
+});
+
 test("explicit CLI model thinking is catalog-resolved before startup fallback", async (suite) => {
 	const provider = "openai-codex";
 	const base = "acme:model/v1.2+fast@2026-09-01";

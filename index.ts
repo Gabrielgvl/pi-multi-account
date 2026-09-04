@@ -6377,6 +6377,8 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			 * outranks an unmeasurable sibling.
 			 */
 			preferSameIdentity?: boolean;
+			/** Preserve an explicit CLI model while moving automatic work to another account. */
+			preserveSameIdentity?: boolean;
 		} = {},
 	) {
 		reconcileCooldownsFromUsage(ctx);
@@ -6471,6 +6473,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 				// on a healthy account. An unranked catalog leftover (claude-4-sonnet beating
 				// grok only because it sorts first) must never steal the user's model.
 				const upgrade =
+					!options.preserveSameIdentity &&
 					config.preferLatestModel &&
 					idRank !== Number.MAX_SAFE_INTEGER &&
 					flagRank < idRank;
@@ -6798,6 +6801,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			availableNowOnly: !options.manual,
 			manualRoundRobin: options.manual,
 			excludeProviders,
+			preserveSameIdentity: !options.manual && explicitCli.model && !modelPreferenceChanged,
 		});
 		// No OTHER account to move to. Because each account now offers only its flagship (the
 		// never-downgrade rule), a single-account session with a just-cleared cooldown lands here
@@ -7036,6 +7040,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 		const candidates = findFallbackModels(ctx, ctx.model, {
 			availableNowOnly: true,
 			includeCurrent: true,
+			preserveSameIdentity: explicitCli.model && !modelPreferenceChanged,
 		});
 		if (candidates.length === 0) return false;
 		return activateFallback(ctx, ctx.model, candidates, reason, {
